@@ -1,0 +1,25 @@
+# MySQL 8.0 CDC source for the Quality Agent Layer 2 demo.
+#   docker compose -f striim/mysql/docker-compose.yml up -d
+# Striim MySQLReader connects on localhost:3306 as user 'striim'.
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: striim-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: qualitydemo
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./my.cnf:/etc/mysql/conf.d/striim.cnf:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - striim-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  striim-mysql-data:

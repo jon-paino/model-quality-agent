@@ -1,0 +1,198 @@
+-- NYC Taxi real-time fare inference pipeline (Phase 4).
+--
+--   trip event  ->  FeatureOp (geohash -> Feast enrichment)
+--               ->  ModelOp   (ONNX scoring of the 15-feature vector)
+--               ->  SysOut                        (live view)
+--               ->  FormatScored CQ -> FileWriter  (capturable JSON output)
+--
+-- ModelOp writes the predicted fare into waevent.userdata["prediction"] (which
+-- SysOut renders) and ALSO appends it as a 7th data[] column (data[6]). The
+-- FormatScored CQ projects data[0..6] into named fields and a JSONFormatter
+-- FileWriter writes one JSON record per event to UploadedFiles/predictions.json.
+-- The data[] copy exists because userdata is not reachable from a formatter.
+--
+-- Prerequisites:
+--   1. Feast serving on 127.0.0.1:6566
+--   2. model.onnx staged at UploadedFiles/model.onnx
+--   3. Both OPs loaded:
+--        LOAD OPEN PROCESSOR 'UploadedFiles/FeatureOp.scm';
+--        LOAD OPEN PROCESSOR 'UploadedFiles/ModelOp.scm';
+--   4. After START, copy a trip feed in with a fresh name, e.g.:
+--        cp striim/pipeline/trips.csv /opt/Striim/UploadedFiles/pipeline_trips_v1.csv
+--
+-- To re-run, first uncomment and execute the cleanup block.
+
+-- STOP APPLICATION qualitydemo.FareInference;
+-- UNDEPLOY APPLICATION qualitydemo.FareInference;
+-- DROP APPLICATION qualitydemo.FareInference CASCADE;
+-- DROP NAMESPACE qualitydemo CASCADE;
+
+-- Namespace is qualitydemo (not inference) so this branch's demo runs in
+-- isolation from any existing inference.FareInference on the cluster. Checkout
+-- master to restore the original inference namespace.
+CREATE NAMESPACE qualitydemo;
+USE qualitydemo;
+
+CREATE APPLICATION FareInference;
+
+-- Native Global.WAEvent source: FileReader + DSVParser. Column order is the
+-- contract -- data[0] = pickup_geohash, data[1..5] = the 5 event features.
+CREATE SOURCE TripSource USING Global.FileReader (
+  directory: 'UploadedFiles',
+  wildcard: 'pipeline_trips*.csv',
+  positionByEOF: false
+)
+PARSE USING Global.DSVParser (
+  header: true,
+  columndelimiter: ','
+)
+OUTPUT TO TripRawStream;
+
+-- Enrichment: FeatureOp looks up the 10 dynamic features from Feast and
+-- merges them into waevent.userdata.
+CREATE STREAM EnrichedStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR FeatureProc USING Global.FeatureOp (
+  FeastUrl: 'http://127.0.0.1:6566',
+  FeatureView: 'cell_dynamic_features_v1',
+  GeohashIndex: 0,
+  -- Phase 1b: label for the feature-store-miss counter MBean the OP registers
+  -- under com.striim.metrics:name=OpCounters.<ns>.<component>,type=OpMetrics,
+  -- which the HealthAgent reads as the feature_miss_rate signal.
+  MetricsNamespace: 'qualitydemo',
+  MetricsComponent: 'FeatureProc',
+  EnableLogging: true
+)
+INSERT INTO EnrichedStream
+FROM TripRawStream;
+
+-- Scoring: ModelOp assembles the 15-feature vector (event features from
+-- data[1..5], dynamic features from userdata) and scores it with ONNX.
+CREATE STREAM ScoredStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR ModelProc USING Global.ModelOp (
+  ModelFile: 'UploadedFiles/model.onnx',
+  EventFeatureIndices: '1,2,3,4,5',
+  -- Phase 1b: label for the NaN-score counter MBean (CounterName "nan_score"),
+  -- read by the HealthAgent as the nan_score_rate signal.
+  MetricsNamespace: 'qualitydemo',
+  MetricsComponent: 'ModelProc',
+  EnableLogging: true
+)
+INSERT INTO ScoredStream
+FROM EnrichedStream;
+
+CREATE TARGET ScoredSink USING Global.SysOut (
+  name: 'FareInference'
+)
+INPUT FROM ScoredStream;
+
+-- Capturable output: project the scored WAEvent's positional data[] into named
+-- fields. data[0] is pickup_geohash, data[1..5] the 5 event features, data[6]
+-- the prediction appended by ModelOp. A formatter cannot read userdata, so the
+-- prediction is read here from its data[] copy.
+CREATE CQ FormatScored
+INSERT INTO ScoredOutputStream
+SELECT
+  TO_STRING(data[0]) AS pickup_geohash,
+  TO_STRING(data[1]) AS hour_of_day,
+  TO_STRING(data[2]) AS day_of_week,
+  TO_STRING(data[3]) AS is_weekend,
+  TO_STRING(data[4]) AS trip_distance,
+  TO_STRING(data[5]) AS passenger_count,
+  TO_STRING(data[6]) AS prediction
+FROM ScoredStream;
+
+-- One JSON record per scored event, written to UploadedFiles/predictions.json.
+CREATE TARGET ScoredFileSink USING Global.FileWriter (
+  directory: 'UploadedFiles',
+  filename: 'predictions.json'
+)
+FORMAT USING Global.JSONFormatter ()
+INPUT FROM ScoredOutputStream;
+
+-- ===================================================================
+-- Quality Monitoring Agent -- Layer 1 (Operational Health).
+--
+-- The agent is a distinct OP component that branches off ScoredStream
+-- (read-only). It lives INSIDE this application so ScoredStream resolves in
+-- scope (a separate app cannot see this stream at CREATE time). Layer 1 is
+-- timer-driven: ModelQualityAgent senses platform health from JMX
+-- (com.striim.metrics) every TickIntervalSec and emits a structured ops_ok
+-- assessment on every tick, independent of whether scored events flow. The
+-- ScoredStream branch is what Layers 2/3 will consume later.
+--
+-- Prerequisites: JMX enabled (EnableJmx=true in conf/startUp.properties AND
+-- -Dstriim.node.jmx.enabled=true in bin/server.sh JMX_ARGS; see CLAUDE.md), and
+-- the module loaded: LOAD OPEN PROCESSOR 'UploadedFiles/ModelQualityAgent.scm';
+-- ===================================================================
+CREATE STREAM HealthAssessmentStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
+  TargetNamespace: 'qualitydemo',
+  TargetAppName: 'FareInference',
+  TickIntervalSec: 30,
+  -- policy (thresholds); override per environment:
+  SourceFreshnessWarnSec: 60,
+  SourceFreshnessFailSec: 300,
+  TargetWriteWarnSec: 60,
+  TargetWriteFailSec: 300,
+  LagWarnMs: 5000,
+  LagFailMs: 30000,
+  MemoryWarnPct: 85,
+  MemoryFailPct: 95,
+  CpuWarnPct: 85,
+  CpuFailPct: 95,
+  -- Phase 1b policy: per-tick windowed miss / NaN-score rate thresholds (percent).
+  FeatureMissRateWarnPct: 5,
+  FeatureMissRateFailPct: 20,
+  NanScoreRateWarnPct: 5,
+  NanScoreRateFailPct: 20,
+  EnableLogging: true
+)
+INSERT INTO HealthAssessmentStream
+FROM ScoredStream;
+
+-- Live view of every assessment tick (renders userdata: verdict + rationale).
+CREATE TARGET HealthSysOut USING Global.SysOut (
+  name: 'QualityMonitor-Layer1'
+)
+INPUT FROM HealthAssessmentStream;
+
+-- Capturable output: project the assessment's positional data[] into named
+-- fields (a formatter cannot read userdata). See the data[] output contract in
+-- ModelQualityAgent.act().
+CREATE CQ FormatHealth
+INSERT INTO HealthAssessmentOutStream
+SELECT
+  TO_STRING(data[0]) AS tick_ts,
+  TO_STRING(data[1]) AS verdict,
+  TO_STRING(data[2]) AS ops_healthy,
+  TO_STRING(data[3]) AS ops_circuit_breaker_open,
+  TO_STRING(data[4]) AS rationale,
+  TO_STRING(data[5]) AS signal_count,
+  TO_STRING(data[6]) AS fail_count,
+  TO_STRING(data[7]) AS warn_count,
+  TO_STRING(data[8]) AS assessment_json,
+  TO_STRING(data[9]) AS target_app
+FROM HealthAssessmentStream;
+
+-- One JSON record per tick to UploadedFiles/health_assessments.json.
+CREATE TARGET HealthFileSink USING Global.FileWriter (
+  directory: 'UploadedFiles',
+  filename: 'health_assessments.json'
+)
+FORMAT USING Global.JSONFormatter ()
+INPUT FROM HealthAssessmentOutStream;
+
+-- EXTENSION POINT (Layers 2/3): additional CQs/OPs consuming ScoredStream for
+-- drift (Layer 2) and performance (Layer 3), each gated on
+-- HealthAssessmentStream.ops_circuit_breaker_open. The POLICY node (retrain
+-- authorization) reads ops_healthy from this stream. When Layers 2/3 grow large
+-- enough to warrant their own lifecycle, split them into a separate app in this
+-- namespace (see striim/quality-agent/quality_agent.tql for that variant).
+
+END APPLICATION FareInference;
+
+DEPLOY APPLICATION qualitydemo.FareInference;
+START APPLICATION qualitydemo.FareInference;

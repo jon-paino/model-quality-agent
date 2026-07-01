@@ -1,0 +1,198 @@
+-- NYC Taxi real-time fare inference pipeline -- MySQL CDC variant (Layer 2).
+--
+-- Same inference graph as inference_pipeline.tql, but the source is swapped from
+-- FileReader+DSVParser over a CSV to a MySQL CDC reader (MysqlReader) over the
+-- `qualitydemo.trips` table, with DDL capture ON. This is what makes the upstream
+-- schema-evolution signal (the source's DDL count, read by the Quality Agent over
+-- JMX as the CDC_OPERATION "No of DDLs" metric) populate: a CSV source emits no
+-- DDL; a MySQL binlog source does.
+--
+--   MySQL trips (binlog CDC)  ->  TripRawStream (Global.WAEvent)
+--               ->  FeatureOp (geohash -> Feast enrichment)
+--               ->  ModelOp   (ONNX scoring of the 15-feature vector)
+--               ->  SysOut + FormatScored CQ -> FileWriter
+--               ->  HealthAgent (Layer 1 ops health; Layer 2 DDL signal)
+--
+-- POSITIONAL CONTRACT (confirmed against the 5.2.0.4 MySQL CDC Reader docs):
+-- for an INSERT, MySQLReader's WAEvent.data[] holds the inserted column values in
+-- table-ordinal order. The `trips` table is defined feature-columns-first, PK last
+-- (see striim/mysql/init.sql), so:
+--   data[0]=pickup_geohash, 1=hour_of_day, 2=day_of_week, 3=is_weekend,
+--   4=trip_distance, 5=passenger_count, 6=trip_id.
+-- FeatureOp (GeohashIndex=0) and ModelOp (EventFeatureIndices='1,2,3,4,5') are
+-- therefore UNCHANGED. ModelOp appends the prediction at the new last slot, which
+-- is now data[7] (since the CDC row carries 7 columns), so FormatScored reads the
+-- prediction from data[7] and surfaces trip_id at data[6] (the one downstream edit).
+--
+-- Prerequisites (BEYOND the CSV pipeline's):
+--   1. MySQL 8.0 up with binlog ROW + row_metadata MINIMAL and the trips loaded:
+--        docker compose -f striim/mysql/docker-compose.yml up -d
+--        .venv/bin/python striim/pipeline/load_mysql_trips.py --rows 500
+--   2. MySQL Connector/J 8.0.30 installed in /opt/Striim/lib (Striim does not ship
+--      it) and Striim restarted. See installing-third-party-drivers docs.
+--   3. Feast on 127.0.0.1:6566; model.onnx + all three .scm staged in UploadedFiles;
+--      JMX enabled (EnableJmx=true AND -Dstriim.node.jmx.enabled=true; see CLAUDE.md).
+--
+-- Cleanup (uncomment to re-run):
+-- STOP APPLICATION qualitydemo.FareInference;
+-- UNDEPLOY APPLICATION qualitydemo.FareInference;
+-- DROP APPLICATION qualitydemo.FareInference CASCADE;
+-- DROP NAMESPACE qualitydemo CASCADE;
+
+CREATE NAMESPACE qualitydemo;
+USE qualitydemo;
+
+CREATE APPLICATION FareInference;
+
+-- MySQL CDC source. CDDLCapture: true turns on schema-evolution capture so the
+-- binlog's DDL is tracked and surfaced over JMX (CDC_OPERATION "No of DDLs" on the
+-- app ROLLUP StriimMBean). CDDLAction: 'Ignore' is the documented-correct setting
+-- for a schemaless target (our FileWriter + JSONFormatter): the DDL is still
+-- COUNTED (the agent's schema_evolution signal), but it is NOT propagated in-band
+-- down the pipeline. That keeps DDL events off FeatureOp, which blindly reads
+-- data[0] as a geohash -- with CDDLAction Process, the 3 probe ALTERs reached
+-- FeatureProc as 3 feature_store_misses (a quiet-tick false RED risk). So we feed
+-- FeatureProc DIRECTLY from the source's WAEvent output (no filter CQ needed; a
+-- SELECT * CQ would re-type the stream and break the WAEvent pass-through). The
+-- CDC user `striim` is read-only (SELECT + REPLICATION); writes/DDL go through root.
+-- FilterTransactionBoundaries (default true) drops BEGIN/COMMIT.
+CREATE SOURCE TripSource USING Global.MysqlReader (
+  ConnectionURL: 'mysql://localhost:3306',
+  Username: 'striim',
+  Password: 'striim_cdc_pw',
+  Password_encrypted: 'false',
+  Tables: 'qualitydemo.trips',
+  CDDLCapture: true,
+  CDDLAction: 'Ignore',
+  FilterTransactionBoundaries: true,
+  SendBeforeImage: true,
+  Compression: false,
+  connectionRetryPolicy: 'retryInterval=30, maxRetries=3'
+)
+OUTPUT TO TripRawStream;
+
+-- Enrichment: FeatureOp looks up the 10 dynamic features from Feast and merges
+-- them into waevent.userdata. (Reads data[0] = pickup_geohash, unchanged.)
+CREATE STREAM EnrichedStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR FeatureProc USING Global.FeatureOp (
+  FeastUrl: 'http://127.0.0.1:6566',
+  FeatureView: 'cell_dynamic_features_v1',
+  GeohashIndex: 0,
+  MetricsNamespace: 'qualitydemo',
+  MetricsComponent: 'FeatureProc',
+  EnableLogging: true
+)
+INSERT INTO EnrichedStream
+FROM TripRawStream;
+
+-- Scoring: ModelOp assembles the 15-feature vector (event features from data[1..5],
+-- dynamic features from userdata) and scores it with ONNX. Unchanged from CSV path.
+CREATE STREAM ScoredStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR ModelProc USING Global.ModelOp (
+  ModelFile: 'UploadedFiles/model.onnx',
+  EventFeatureIndices: '1,2,3,4,5',
+  MetricsNamespace: 'qualitydemo',
+  MetricsComponent: 'ModelProc',
+  EnableLogging: true
+)
+INSERT INTO ScoredStream
+FROM EnrichedStream;
+
+CREATE TARGET ScoredSink USING Global.SysOut (
+  name: 'FareInference'
+)
+INPUT FROM ScoredStream;
+
+-- Capturable output: data[0..5] are the 6 features, data[6] is trip_id (the CDC
+-- surrogate PK), data[7] is the prediction ModelOp appended (one slot past the
+-- 7-column CDC row). This is the only downstream change vs the CSV pipeline.
+CREATE CQ FormatScored
+INSERT INTO ScoredOutputStream
+SELECT
+  TO_STRING(data[0]) AS pickup_geohash,
+  TO_STRING(data[1]) AS hour_of_day,
+  TO_STRING(data[2]) AS day_of_week,
+  TO_STRING(data[3]) AS is_weekend,
+  TO_STRING(data[4]) AS trip_distance,
+  TO_STRING(data[5]) AS passenger_count,
+  TO_STRING(data[6]) AS trip_id,
+  TO_STRING(data[7]) AS prediction
+FROM ScoredStream;
+
+CREATE TARGET ScoredFileSink USING Global.FileWriter (
+  directory: 'UploadedFiles',
+  filename: 'predictions.json'
+)
+FORMAT USING Global.JSONFormatter ()
+INPUT FROM ScoredOutputStream;
+
+-- ===================================================================
+-- Quality Monitoring Agent -- Layer 1 (Operational Health) + Layer 2 Phase 1.
+--
+-- Wired as the CSV pipeline, plus the Layer 2 Phase 1 `schema_evolution` signal:
+-- the agent reads the source's per-tick DDL-count delta (CDC_OPERATION "No of
+-- DDLs" on the app ROLLUP StriimMBean) and WARNs when it crosses DdlWarnDelta.
+-- The signal is UNKNOWN on a non-CDC source, so this same agent stays correct on
+-- the CSV pipeline.
+-- ===================================================================
+CREATE STREAM HealthAssessmentStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
+  TargetNamespace: 'qualitydemo',
+  TargetAppName: 'FareInference',
+  TickIntervalSec: 30,
+  SourceFreshnessWarnSec: 60,
+  SourceFreshnessFailSec: 300,
+  TargetWriteWarnSec: 60,
+  TargetWriteFailSec: 300,
+  LagWarnMs: 5000,
+  LagFailMs: 30000,
+  MemoryWarnPct: 85,
+  MemoryFailPct: 95,
+  CpuWarnPct: 85,
+  CpuFailPct: 95,
+  FeatureMissRateWarnPct: 5,
+  FeatureMissRateFailPct: 20,
+  NanScoreRateWarnPct: 5,
+  NanScoreRateFailPct: 20,
+  -- Layer 2 Phase 1 policy: WARN when the source's DDL count rises by >= this many
+  -- in a tick. Default 1 (any DDL alerts). WARN only in Phase 1 (no circuit breaker).
+  DdlWarnDelta: 1,
+  EnableLogging: true
+)
+INSERT INTO HealthAssessmentStream
+FROM ScoredStream;
+
+CREATE TARGET HealthSysOut USING Global.SysOut (
+  name: 'QualityMonitor-Layer1'
+)
+INPUT FROM HealthAssessmentStream;
+
+CREATE CQ FormatHealth
+INSERT INTO HealthAssessmentOutStream
+SELECT
+  TO_STRING(data[0]) AS tick_ts,
+  TO_STRING(data[1]) AS verdict,
+  TO_STRING(data[2]) AS ops_healthy,
+  TO_STRING(data[3]) AS ops_circuit_breaker_open,
+  TO_STRING(data[4]) AS rationale,
+  TO_STRING(data[5]) AS signal_count,
+  TO_STRING(data[6]) AS fail_count,
+  TO_STRING(data[7]) AS warn_count,
+  TO_STRING(data[8]) AS assessment_json,
+  TO_STRING(data[9]) AS target_app
+FROM HealthAssessmentStream;
+
+CREATE TARGET HealthFileSink USING Global.FileWriter (
+  directory: 'UploadedFiles',
+  filename: 'health_assessments.json'
+)
+FORMAT USING Global.JSONFormatter ()
+INPUT FROM HealthAssessmentOutStream;
+
+END APPLICATION FareInference;
+
+DEPLOY APPLICATION qualitydemo.FareInference;
+START APPLICATION qualitydemo.FareInference;

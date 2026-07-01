@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.striim.demo</groupId>
+    <artifactId>ModelQualityAgent</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>ModelQualityAgent</name>
+    <description>Striim Open Processor: Quality Monitoring Agent, Layer 1 (Operational Health) via JMX</description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <!-- Striim install. Override with -DSTRIIM_HOME=... if not at /opt/Striim. -->
+        <STRIIM_HOME>/opt/Striim</STRIIM_HOME>
+        <STRIIM_VERSION>5.2.0.4</STRIIM_VERSION>
+        <jackson.version>2.14.0</jackson.version>
+    </properties>
+
+    <dependencies>
+        <!-- Striim jars are system-scoped: resolved straight from the install,
+             never downloaded, never bundled into the .scm. -->
+        <dependency>
+            <groupId>com.striim</groupId>
+            <artifactId>OpenProcessorSDK</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>system</scope>
+            <systemPath>${STRIIM_HOME}/StriimSDK/StriimOpenProcessor-SDK.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>com.webaction</groupId>
+            <artifactId>Platform</artifactId>
+            <version>${STRIIM_VERSION}</version>
+            <scope>system</scope>
+            <systemPath>${STRIIM_HOME}/lib/Platform-${STRIIM_VERSION}.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>com.webaction</groupId>
+            <artifactId>Common</artifactId>
+            <version>${STRIIM_VERSION}</version>
+            <scope>system</scope>
+            <systemPath>${STRIIM_HOME}/lib/Common-${STRIIM_VERSION}.jar</systemPath>
+        </dependency>
+
+        <!-- Jackson builds the MCP-ready structured assessment JSON. provided:
+             Striim ships jackson-databind-2.14.0.jar in lib/, so it is on the
+             compile classpath here but not bundled into the .scm (same as FeatureOp). -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Produces target/ModelQualityAgent.jar; build.sh copies it to .scm. -->
+        <finalName>ModelQualityAgent</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>${maven.compiler.source}</source>
+                    <target>${maven.compiler.target}</target>
+                </configuration>
+            </plugin>
+            <!-- Shade writes the Striim manifest entries. The agent bundles no
+                 third-party libraries (Jackson is provided), so the jar is just
+                 our classes. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                    <transformers>
+                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                            <manifestEntries>
+                                <Striim-Module-Name>ModelQualityAgent</Striim-Module-Name>
+                                <Striim-Service-Interface>com.webaction.runtime.components.openprocessor.StriimOpenProcessor</Striim-Service-Interface>
+                                <Striim-Service-Implementation>com.striim.demo.ModelQualityAgent</Striim-Service-Implementation>
+                            </manifestEntries>
+                        </transformer>
+                    </transformers>
+                    <artifactSet>
+                        <excludes>
+                            <exclude>org.slf4j:*</exclude>
+                            <exclude>log4j:*</exclude>
+                        </excludes>
+                    </artifactSet>
+                    <filters>
+                        <filter>
+                            <artifact>*:*</artifact>
+                            <excludes>
+                                <exclude>module-info.class</exclude>
+                                <exclude>META-INF/versions/*/module-info.class</exclude>
+                                <exclude>META-INF/*.SF</exclude>
+                                <exclude>META-INF/*.DSA</exclude>
+                                <exclude>META-INF/*.RSA</exclude>
+                            </excludes>
+                        </filter>
+                    </filters>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

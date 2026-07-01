@@ -1,0 +1,52 @@
+[project]
+name = "model-quality-agent"
+version = "0.1.0"
+description = "Python side (Scenario A) of the Striim model-quality-agent: feature engineering, Feast, XGBoost training, and ONNX export."
+requires-python = ">=3.12,<3.13"
+
+# Base deps: what the runtime feature/Feast code and the swap-test harness import.
+dependencies = [
+    # Data
+    "pandas>=2.2,<3",
+    "numpy>=1.26,<2.2",
+    "pyarrow>=15,<19",
+    # Feature store (sqlite online + file offline per feature_repo/feature_store.yaml; no redis needed)
+    "feast>=0.40,<0.42",
+    # ONNX (swap-test artifact generation in striim/model-op/test/make_swap_artifacts.py)
+    "onnx>=1.16,<2",
+    "onnxruntime>=1.18,<2",
+    # CLI (feast_writer / feast_streamer / features / feast_setup)
+    "click>=8.1,<9",
+    # MySQL CDC loader (striim/pipeline/load_mysql_trips.py uses mysql+pymysql via SQLAlchemy)
+    "sqlalchemy>=2.0,<3",
+    "pymysql>=1.1,<2",
+]
+
+[project.optional-dependencies]
+# Recovered Scenario-A training/ONNX/validation scripts (train.py, export_onnx.py,
+# feast_setup.py, oracle.py, geo.py, crossval.py). Reference-grade: they train the
+# XGBoost fare model and export model.onnx, but need the (left-behind) processed
+# parquet re-supplied to run end to end.
+training = [
+    "scikit-learn>=1.4,<1.6",
+    "xgboost>=2.0,<2.2",
+    "onnxmltools>=1.12,<2",
+    "optuna>=4.8.0",
+    "python-geohash>=0.8.5,<0.9",
+    "requests>=2.31,<3",
+]
+dev = [
+    "ruff>=0.5,<0.10",
+    "pytest>=8,<9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["model"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

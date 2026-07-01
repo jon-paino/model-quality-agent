@@ -1,0 +1,46 @@
+-- Quality Monitoring Agent -- Layer 1 (Operational Health).
+--
+-- DEFAULT PATH: Layer 1 now ships INSIDE qualitydemo.FareInference
+-- (striim/pipeline/inference_pipeline.tql). Deploy that one app and the agent
+-- comes with it, branching off ScoredStream in-scope. Use that, not this file,
+-- for the demo.
+--
+-- This file is kept for two purposes: (1) RECOVERY from the failed separate-app
+-- attempt below, and (2) a REFERENCE separate-app variant for when Layers 2/3
+-- grow enough to warrant their own application lifecycle.
+--
+-- WHY a separate app failed: a stream is only visible at CREATE time within the
+-- application (and namespace) that defines it. An OP in app B doing
+-- "FROM qualitydemo.ScoredStream" gets "Stream not found" unless ScoredStream
+-- already exists, and cross-namespace stream consumption is not reliable. The
+-- robust pattern is the combined app (above). If you do split later, define the
+-- agent app in the SAME namespace (qualitydemo) and deploy FareInference FIRST.
+
+-- ----------------------------------------------------------------------
+-- RECOVERY: drop the half-created app from a failed separate-app run.
+-- (It only got as far as CREATE APPLICATION + the stream before the OP failed,
+-- so it is not deployed; DROP is enough.)
+-- ----------------------------------------------------------------------
+-- DROP APPLICATION quality.QualityMonitor CASCADE;
+-- DROP NAMESPACE quality CASCADE;
+
+-- ======================================================================
+-- REFERENCE ONLY -- separate-app variant. Do NOT run alongside the combined
+-- app in inference_pipeline.tql (that would double-register the agent OP and
+-- its streams). Requires qualitydemo.FareInference DEPLOYED first.
+-- ======================================================================
+-- USE qualitydemo;
+--
+-- CREATE STREAM HealthAssessmentStream OF Global.WAEvent;
+--
+-- CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
+--   TargetNamespace: 'qualitydemo',
+--   TargetAppName: 'FareInference',
+--   TickIntervalSec: 30,
+--   EnableLogging: true
+-- )
+-- INSERT INTO HealthAssessmentStream
+-- FROM qualitydemo.ScoredStream;   -- resolves only if FareInference is deployed
+--
+-- CREATE TARGET HealthSysOut USING Global.SysOut ( name: 'QualityMonitor-Layer1' )
+-- INPUT FROM HealthAssessmentStream;
