@@ -143,6 +143,16 @@ CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
   TargetNamespace: 'qualitydemo',
   TargetAppName: 'FareInference',
   TickIntervalSec: 30,
+  -- Week 1: SaaS-safe transport (see inference_pipeline.tql for the full note).
+  -- schema_evolution (DDL) still reads the in-JVM ROLLUP bean via the shared helper,
+  -- so it works under MON_REST on a JMX-enabled cluster (UNKNOWN on SaaS until the
+  -- REST DDL port). MonRestPassword should be a Vault reference; do not commit a secret.
+  HealthSource: 'MON_REST',
+  MonRestBaseUrl: 'http://localhost:9080',
+  MonRestUser: 'admin',
+  MonRestPassword: '[qualitydemo.vault.striim_admin_pw]',
+  MonRestTimeoutSec: 5,
+  MlMetricsSource: 'STREAM',
   SourceFreshnessWarnSec: 60,
   SourceFreshnessFailSec: 300,
   TargetWriteWarnSec: 60,
@@ -151,6 +161,8 @@ CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
   LagFailMs: 30000,
   MemoryWarnPct: 85,
   MemoryFailPct: 95,
+  MemoryFreeWarnGb: 2,
+  MemoryFreeFailGb: 1,
   CpuWarnPct: 85,
   CpuFailPct: 95,
   FeatureMissRateWarnPct: 5,

@@ -132,6 +132,19 @@ CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
   TargetNamespace: 'qualitydemo',
   TargetAppName: 'FareInference',
   TickIntervalSec: 30,
+  -- Week 1: SaaS-safe transport. Platform health is read from Striim's mon/REST API
+  -- (JMX platform-health beans require striim.node.jmx.enabled, which is unavailable
+  -- on SaaS). MonRestPassword should be a Vault reference [ns.vault.prop]; a plaintext
+  -- value works for local dev but must not be committed. Set HealthSource: 'JMX' to use
+  -- the legacy in-JVM MBean path on a self-managed cluster with JMX enabled.
+  HealthSource: 'MON_REST',
+  MonRestBaseUrl: 'http://localhost:9080',
+  MonRestUser: 'admin',
+  MonRestPassword: '[qualitydemo.vault.striim_admin_pw]',
+  MonRestTimeoutSec: 5,
+  -- ML signals (feature-store miss, NaN score) ride the scored stream's userdata;
+  -- the OP-counter MBean is the per-tick fallback when the stream has no data.
+  MlMetricsSource: 'STREAM',
   -- policy (thresholds); override per environment:
   SourceFreshnessWarnSec: 60,
   SourceFreshnessFailSec: 300,
@@ -141,6 +154,10 @@ CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
   LagFailMs: 30000,
   MemoryWarnPct: 85,
   MemoryFailPct: 95,
+  -- MON_REST free-memory floor (GB): the mon/REST source exposes free memory, not a
+  -- used-percent, so node_memory is judged as "WARN/FAIL when free drops below X GB".
+  MemoryFreeWarnGb: 2,
+  MemoryFreeFailGb: 1,
   CpuWarnPct: 85,
   CpuFailPct: 95,
   -- Phase 1b policy: per-tick windowed miss / NaN-score rate thresholds (percent).

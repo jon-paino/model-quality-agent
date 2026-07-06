@@ -252,6 +252,14 @@ public class FeatureOp extends StriimOpenProcessor {
                 }
                 waevent.userdata.putAll(dynamic);
 
+                // Week 1: stamp the cumulative feature-store-miss counters onto the
+                // stream (the JMX-free path the Quality Agent aggregates). Only
+                // survivors are sent, but recordEvent/recordFault ran before any drop,
+                // so the cumulative is already correct here; a 100%-miss tick sends
+                // nothing, so the agent reads feature_miss_rate as UNKNOWN, never PASS.
+                waevent.userdata.put("feature_miss_events_seen", missCounter.getEventsSeen());
+                waevent.userdata.put("feature_miss_faults", missCounter.getFaults());
+
                 log("merged " + dynamic.size() + " dynamic features for geohash=" + geohash);
                 send(waevent);
             }

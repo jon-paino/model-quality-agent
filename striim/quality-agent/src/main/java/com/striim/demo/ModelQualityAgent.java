@@ -1,15 +1,29 @@
 package com.striim.demo;
 
 import java.lang.management.ManagementFactory;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
@@ -20,9 +34,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.webaction.anno.AdapterType;
 import com.webaction.anno.PropertyTemplate;
 import com.webaction.anno.PropertyTemplateProperty;
+import com.webaction.metaRepository.MDCache;
 import com.webaction.runtime.components.openprocessor.StriimOpenProcessor;
 import com.webaction.runtime.containers.IBatch;
 import com.webaction.runtime.containers.WAEvent;
+import com.webaction.security.Password;
+import com.webaction.uuid.AuthToken;
+import com.webaction.web.api.VaultAPI;
 
 /**
  * ModelQualityAgent -- Layer 1 (Operational Health) of the Quality Monitoring
@@ -39,9 +57,10 @@ import com.webaction.runtime.containers.WAEvent;
  *
  * <p>The loop is an explicit perceive -> assess -> act cycle:
  * <ul>
- *   <li>PERCEIVE ({@link #perceive}): read the Layer 1 JMX signals for the target
- *       application, discovering every source/target via namespace-scoped
- *       ObjectName patterns rather than hardcoded component names.</li>
+ *   <li>PERCEIVE ({@link #perceive}): collect the Layer 1 signals for the target
+ *       application from the configured HealthSource -- MON_REST (default, the
+ *       SaaS-safe mon-command + REST API) or JMX (the in-JVM platform MBeanServer,
+ *       for self-managed clusters) -- both populating the same HealthSnapshot.</li>
  *   <li>ASSESS ({@link #assess}): evaluate each signal against its configured
  *       threshold (the agent's "policy," exposed as properties) and roll up to an
  *       overall {@code ops_ok} verdict (GREEN / YELLOW / RED) plus an
@@ -80,6 +99,22 @@ import com.webaction.runtime.containers.WAEvent;
                 defaultValue = "30"),
         @PropertyTemplateProperty(name = "JmxDomain", type = String.class, required = false,
                 defaultValue = "com.striim.metrics"),
+        // ---- transport: how platform health is collected. MON_REST (default) uses
+        // Striim's mon-command + REST API (the only SaaS-safe path; the JMX platform
+        // health beans require striim.node.jmx.enabled, unavailable on SaaS). JMX
+        // keeps the legacy in-JVM MBean path for self-managed clusters. ----
+        @PropertyTemplateProperty(name = "HealthSource", type = String.class, required = false,
+                defaultValue = "MON_REST"),
+        @PropertyTemplateProperty(name = "MonRestBaseUrl", type = String.class, required = false,
+                defaultValue = "http://localhost:9080"),
+        @PropertyTemplateProperty(name = "MonRestUser", type = String.class, required = false,
+                defaultValue = "admin"),
+        @PropertyTemplateProperty(name = "MonRestPassword", type = Password.class, required = false,
+                defaultValue = ""),
+        @PropertyTemplateProperty(name = "MonRestTimeoutSec", type = Integer.class, required = false,
+                defaultValue = "5"),
+        @PropertyTemplateProperty(name = "MonRestMaxRetryNum", type = Integer.class, required = false,
+                defaultValue = "2"),
         // ---- policy: app status ----
         @PropertyTemplateProperty(name = "HealthyStatus", type = String.class, required = false,
                 defaultValue = "RUNNING"),
@@ -108,6 +143,15 @@ import com.webaction.runtime.containers.WAEvent;
                 defaultValue = "85"),
         @PropertyTemplateProperty(name = "CpuFailPct", type = Integer.class, required = false,
                 defaultValue = "95"),
+        // ---- policy: node free-memory floor (GB). Used by the MON_REST source,
+        // which exposes freeMemory (absolute) not a used-percent: WARN/FAIL when free
+        // memory drops to/below the floor. The JMX source keeps MemoryWarnPct/
+        // MemoryFailPct (used-%); whichever representation the source provides is
+        // the one assessed. ----
+        @PropertyTemplateProperty(name = "MemoryFreeWarnGb", type = Integer.class, required = false,
+                defaultValue = "2"),
+        @PropertyTemplateProperty(name = "MemoryFreeFailGb", type = Integer.class, required = false,
+                defaultValue = "1"),
         // ---- policy: discarded events (count delta per tick) ----
         @PropertyTemplateProperty(name = "DiscardedWarnDelta", type = Integer.class, required = false,
                 defaultValue = "1"),
@@ -123,6 +167,12 @@ import com.webaction.runtime.containers.WAEvent;
                 defaultValue = "5"),
         @PropertyTemplateProperty(name = "NanScoreRateFailPct", type = Integer.class, required = false,
                 defaultValue = "20"),
+        // ---- ML metrics source: STREAM (default) reads the miss/NaN counters off the
+        // scored stream's userdata (JMX-free); MBEAN reads the in-JVM OP-counter beans.
+        // In STREAM mode the MBean is still read as a per-tick fallback when the stream
+        // has no data (e.g. a 100%-miss tick emits no scored event). ----
+        @PropertyTemplateProperty(name = "MlMetricsSource", type = String.class, required = false,
+                defaultValue = "STREAM"),
         // ---- Layer 2 Phase 1 policy: upstream schema-evolution (DDL). WARN when
         // the per-tick delta of the source's DDL count crosses this threshold.
         // Phase 1 caps the signal at WARN (alert + verdict only, no circuit
@@ -162,18 +212,38 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     private long sourceWarnMs, sourceFailMs, targetWarnMs, targetFailMs;
     private long lagWarnMs, lagFailMs;
     private int memWarnPct, memFailPct, cpuWarnPct, cpuFailPct;
+    private int memFreeWarnGb, memFreeFailGb;   // MON_REST free-memory floor (GB)
     private long discardedWarnDelta, discardedFailDelta;
     private int featureMissWarnPct, featureMissFailPct, nanScoreWarnPct, nanScoreFailPct;
+    private String mlMetricsSource;          // "STREAM" | "MBEAN"
     private long ddlWarnDelta;       // Layer 2 Phase 1: DDL-count delta WARN threshold
     private boolean backpressureIsFail;
     private boolean treatYellowAsHealthy;
     private boolean enableLogging;
+
+    // ---- transport (mon/REST) config ----
+    private String healthSource;             // "JMX" | "MON_REST"
+    private String monRestBaseUrl;
+    private String monRestUser;
+    private String monRestPassword;          // vault-resolved (or literal)
+    private int monRestTimeoutSec;
+    private int monRestMaxRetryNum;
 
     // ---- runtime state ----
     private MBeanServer mbs;
     private ObjectMapper mapper;
     private ScheduledExecutorService scheduler;
     private final Object emitLock = new Object();
+
+    // ---- mon/REST transport runtime (built in start() only for HealthSource=MON_REST) ----
+    private HttpClient httpClient;
+    private ExecutorService httpExecutor;    // bounds each HTTP call off the tick thread
+    private volatile String monToken;        // cached STRIIM-TOKEN; re-auth on 401
+    private final Object tokenLock = new Object();
+    // AuthToken for vault resolution of MonRestPassword (same pattern as FeatureOp).
+    private final AuthToken vaultToken = MDCache.getInstance().getWASecurityManagerToken();
+    private static final DateTimeFormatter MON_TS_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     // Cumulative discarded-event counts per component, for tick-over-tick delta.
     private final Map<String, Long> lastDiscarded = new LinkedHashMap<>();
@@ -182,6 +252,13 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     // CounterName, for computing the per-tick windowed rate (the same delta pattern
     // as lastDiscarded). The MBean stays cumulative; the windowing lives here.
     private final Map<String, long[]> lastOpCounter = new LinkedHashMap<>();
+
+    // Week 1: cumulative ML counters aggregated off the SCORED STREAM (userdata),
+    // written by run() (event thread) and read by assess() (tick thread). The
+    // monotonic-max merge makes concurrent/duplicate batch reads idempotent. Its own
+    // per-tick baseline (separate from lastOpCounter) drives the windowed rate.
+    private final MlStreamCounters streamCounters = new MlStreamCounters();
+    private final Map<String, long[]> lastStreamCounter = new LinkedHashMap<>();
 
     // Layer 2 Phase 1: last-seen cumulative source DDL count ("No of DDLs"), for the
     // per-tick delta (same pattern as lastDiscarded). Sentinel -1 = no baseline yet,
@@ -221,13 +298,43 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         featureMissFailPct = parseInt(p.get("FeatureMissRateFailPct"), 20);
         nanScoreWarnPct = parseInt(p.get("NanScoreRateWarnPct"), 5);
         nanScoreFailPct = parseInt(p.get("NanScoreRateFailPct"), 20);
+        mlMetricsSource = Objects.toString(p.get("MlMetricsSource"), "STREAM").trim().toUpperCase();
         ddlWarnDelta = parseInt(p.get("DdlWarnDelta"), 1);
         backpressureIsFail = parseBool(p.get("BackpressureIsFail"), false);
         treatYellowAsHealthy = parseBool(p.get("TreatYellowAsHealthy"), true);
         enableLogging = parseBool(p.get("EnableLogging"), true);
 
+        // ---- transport (mon/REST) ----
+        healthSource = Objects.toString(p.get("HealthSource"), "MON_REST").trim().toUpperCase();
+        monRestBaseUrl = stripTrailingSlash(
+                Objects.toString(p.get("MonRestBaseUrl"), "http://localhost:9080"));
+        monRestUser = Objects.toString(p.get("MonRestUser"), "admin");
+        final Object monPw = p.get("MonRestPassword");
+        final String monPwResolved = (monPw instanceof Password)
+                ? getVaultProperty(((Password) monPw).getPlain().toString())
+                : Objects.toString(monPw, "");
+        monRestPassword = (monPwResolved == null) ? "" : monPwResolved;
+        monRestTimeoutSec = Math.max(1, parseInt(p.get("MonRestTimeoutSec"), 5));
+        monRestMaxRetryNum = Math.max(0, parseInt(p.get("MonRestMaxRetryNum"), 2));
+        memFreeWarnGb = parseInt(p.get("MemoryFreeWarnGb"), 2);
+        memFreeFailGb = parseInt(p.get("MemoryFreeFailGb"), 1);
+
         mbs = ManagementFactory.getPlatformMBeanServer();
         mapper = new ObjectMapper();
+
+        if ("MON_REST".equals(healthSource)) {
+            httpClient = HttpClient.newBuilder()
+                    .version(HttpClient.Version.HTTP_1_1)
+                    .connectTimeout(Duration.ofSeconds(monRestTimeoutSec))
+                    .build();
+            // Small bounded pool so each HTTP call is capped by future.get(timeout)
+            // and a hung request never freezes the tick thread (the sole emitter).
+            httpExecutor = Executors.newFixedThreadPool(2, r -> {
+                final Thread t = new Thread(r, AGENT_NAME + "-http");
+                t.setDaemon(true);
+                return t;
+            });
+        }
 
         // The agent runs its perceive -> assess -> act loop on its OWN timer, not
         // off run(). A single-threaded scheduler means ticks never overlap, so the
@@ -240,8 +347,9 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         });
         scheduler.scheduleAtFixedRate(this::safeTick, 2, tickIntervalSec, TimeUnit.SECONDS);
 
-        log("started: watching " + fqApp + " via JMX domain " + jmxDomain
-                + " every " + tickIntervalSec + "s");
+        log("started: watching " + fqApp + " via " + healthSource + " ("
+                + ("MON_REST".equals(healthSource) ? monRestBaseUrl : jmxDomain)
+                + ") every " + tickIntervalSec + "s");
     }
 
     /** One perceive -> assess -> act cycle, guarded so the loop never dies. */
@@ -267,9 +375,16 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     }
 
     // =====================================================================
-    // PERCEIVE: read the Layer 1 JMX signals for the target application.
+    // PERCEIVE: collect Layer 1 signals into a HealthSnapshot (the seam), from
+    // the configured source. MON_REST (default) uses Striim's mon-command + REST
+    // API (SaaS-safe); JMX reads the in-JVM platform MBeanServer (self-managed).
     // =====================================================================
     private HealthSnapshot perceive() {
+        return "MON_REST".equals(healthSource) ? perceiveMonRest() : perceiveJmx();
+    }
+
+    // ---- JMX source: read Layer 1 signals from the in-JVM platform MBeanServer. ----
+    private HealthSnapshot perceiveJmx() {
         final HealthSnapshot s = new HealthSnapshot();
         final long now = System.currentTimeMillis();
         s.tickTs = now;
@@ -335,19 +450,89 @@ public class ModelQualityAgent extends StriimOpenProcessor {
             break; // single local node in this deployment
         }
 
-        // Phase 1b: application-level OP counters (feature-store miss rate, NaN
-        // score rate). FeatureOp/ModelOp register public DynamicMBeans under this
-        // same JMX domain (com.striim.metrics:name=OpCounters.<ns>.<comp>,type=
-        // OpMetrics), so they are read uniformly here, by the same defensive
-        // queryNames path as every other signal. The bean is self-describing: its
-        // CounterName attribute (feature_store_miss / nan_score) is the
-        // discriminator, so the agent does not hardcode component names. The beans
-        // expose only cumulative monotonic totals; the windowed rate is derived in
-        // assess() from tick-over-tick deltas.
-        //
-        // Classification note: this signal group sits on the Layer 1 / Layer 2
-        // boundary. It is kept as one structured list (opCounters) precisely so it
-        // could be re-pointed to Layer 2 later without reworking the 1a signals.
+        // OP-counter application signals (feature-store miss, NaN score) + Layer 2
+        // schema-evolution DDL: both live on the in-JVM MBeanServer and are read the
+        // same way regardless of source (see the shared helpers below).
+        readOpCounterMbeans(s);
+        readSchemaEvolutionMbean(s);
+        return s;
+    }
+
+    // ---- MON_REST source: read Layer 1 signals from Striim's mon-command + REST
+    // API (the SaaS-safe transport). Every HTTP call is bounded off the tick thread
+    // (see runMonCommand), so a hung request degrades to UNKNOWN, never a freeze. ----
+    private HealthSnapshot perceiveMonRest() {
+        final HealthSnapshot s = new HealthSnapshot();
+        s.tickTs = System.currentTimeMillis();
+        // Backpressure and discarded_events have no clean mon/REST field (confirmed
+        // by the Task 0 probe), so they stay UNKNOWN rather than reporting a false
+        // PASS. discarded stays UNKNOWN via an empty map; backpressure needs a flag
+        // (an empty list would otherwise assess as PASS).
+        s.backpressureKnown = false;
+
+        // mon <fqApp>; -> app_status (output.statusChange) + per-component freshness
+        // (applicationComponents[].latestActivity, matched on entityType SOURCE/TARGET).
+        final JsonNode appOut = monOutput("mon " + fqApp + ";");
+        if (appOut != null) {
+            s.appStatus = text(appOut.get("statusChange"));
+            final JsonNode comps = appOut.get("applicationComponents");
+            if (comps != null && comps.isArray()) {
+                for (final JsonNode c : comps) {
+                    final String etype = text(c.get("entityType"));
+                    final String fq = text(c.get("fullName"));
+                    final Long lastMs = parseMonTs(text(c.get("latestActivity")));
+                    final String nm = (fq != null) ? fq : "?";
+                    if ("SOURCE".equalsIgnoreCase(etype)) {
+                        s.sources.add(new ComponentTime(nm, lastMs));
+                    } else if ("TARGET".equalsIgnoreCase(etype)) {
+                        s.targets.add(new ComponentTime(nm, lastMs));
+                    }
+                }
+            }
+        }
+
+        // report lee; -> lagEndToEnd per source->target pair (SECONDS); take the max,
+        // converted to ms for the existing threshold math (assessLag reads ms).
+        final JsonNode leeOut = monOutput("report lee;");
+        if (leeOut != null && leeOut.isArray()) {
+            Double maxMs = null;
+            for (final JsonNode row : leeOut) {
+                final Double sec = parseSeconds(text(row.get("lagEndToEnd")));
+                if (sec != null) {
+                    final double ms = sec * 1000.0;
+                    maxMs = (maxMs == null) ? ms : Math.max(maxMs, ms);
+                }
+            }
+            s.maxLagMs = maxMs;
+        }
+
+        // mon; -> node cpu% (cpuRate) + free memory (freeMemory, absolute; assessed as
+        // a free-memory floor since no used-% / total is exposed over REST).
+        final JsonNode allOut = monOutput("mon;");
+        if (allOut != null) {
+            final JsonNode nodes = allOut.get("striimClusterNodes");
+            if (nodes != null && nodes.isArray() && nodes.size() > 0) {
+                final JsonNode node = nodes.get(0);
+                s.cpuPct = parsePercentFloat(text(node.get("cpuRate")));
+                s.memoryFreeGb = parseMemGb(text(node.get("freeMemory")));
+            }
+        }
+
+        // OP counters + schema-evolution DDL are OP-/platform-registered on the in-JVM
+        // MBeanServer, independent of the platform JMX health gating, so they are still
+        // read where present (degrading to UNKNOWN where absent, e.g. on SaaS). Task 5
+        // adds the on-stream ML path with this MBean read as the toggled fallback.
+        readOpCounterMbeans(s);
+        readSchemaEvolutionMbean(s);
+        return s;
+    }
+
+    /** Reads the OP-counter DynamicMBeans (feature_store_miss, nan_score) from the
+     *  in-JVM MBeanServer into the snapshot. Self-describing via CounterName; a
+     *  missing bean simply contributes nothing (-> UNKNOWN in assess). Shared by both
+     *  perceive sources: these beans are OP-self-registered, so they are readable even
+     *  when the platform JMX health beans are not. */
+    private void readOpCounterMbeans(final HealthSnapshot s) {
         for (final ObjectName on : query("name=OpCounters." + ns + ".*,type=OpMetrics")) {
             final String counterName = asString(getAttr(on, "CounterName"));
             if (counterName == null) {
@@ -360,20 +545,13 @@ public class ModelQualityAgent extends StriimOpenProcessor {
                     component != null ? component : on.getKeyProperty("name"),
                     eventsSeen, faults));
         }
+    }
 
-        // Layer 2 Phase 1: upstream schema-evolution (DDL), read off the app ROLLUP
-        // StriimMBean (ROLLUP.<ns>.<app>). The DDL count is SPLIT across attributes
-        // by disposition: CDC_OPERATION "No of DDLs" counts DDLs that were PROCESSED
-        // (CDDLAction Process), while DDL_METRICS "Ignored DDL Count" / "Filtered DDL
-        // Count" count the rest. We SUM all three so the signal is correct under any
-        // CDDLAction. Our pipeline uses CDDLAction Ignore (the documented setting for
-        // a schemaless FileWriter target, which also keeps DDL events off the
-        // inference OPs), so the DDLs land in "Ignored DDL Count" -- confirmed live.
-        // The literal statement is DDL_METRICS "Last Received DDL". A file / non-CDC
-        // source has none of these attributes, so this stays null -> the signal is
-        // UNKNOWN, never a false alarm (same posture as discarded_events on a file
-        // pipeline). NOTE: on this 5.2.0.4 build the count is in CDC_OPERATION /
-        // DDL_METRICS JSON, NOT a NUM_OF_DDLS_EXECUTED attribute.
+    /** Reads the source's cumulative DDL count (schema_evolution) off the app ROLLUP
+     *  StriimMBean. The count is split by disposition across CDC_OPERATION /
+     *  DDL_METRICS JSON attributes, so all three are summed. Null (all absent) ->
+     *  UNKNOWN, never a false alarm (non-CDC source, or the bean is absent on SaaS). */
+    private void readSchemaEvolutionMbean(final HealthSnapshot s) {
         final ObjectName rollup = name("name=ROLLUP." + fqApp + ",type=StriimMBean");
         final String cdcOp = asString(getAttr(rollup, "CDC_OPERATION"));
         final String ddlMetrics = asString(getAttr(rollup, "DDL_METRICS"));
@@ -381,8 +559,212 @@ public class ModelQualityAgent extends StriimOpenProcessor {
                             jsonLong(ddlMetrics, "Ignored DDL Count"),
                             jsonLong(ddlMetrics, "Filtered DDL Count"));
         s.lastDdl = jsonFirstText(ddlMetrics, "Last Received DDL");
+    }
 
-        return s;
+    // =====================================================================
+    // mon/REST transport: authenticate + run Tungsten console commands, each
+    // bounded off the tick thread so a hung HTTP call never freezes emission.
+    // =====================================================================
+
+    /** Runs a Tungsten console command over REST and returns its {@code output} JSON
+     *  node (an object for {@code mon}, an array for {@code report lee}), or null on
+     *  any failure/timeout. */
+    private JsonNode monOutput(final String command) {
+        final String body = runMonCommand(command);
+        if (body == null) {
+            return null;
+        }
+        try {
+            final JsonNode root = mapper.readTree(body);
+            final JsonNode first = (root.isArray() && root.size() > 0) ? root.get(0) : root;
+            if (!"Success".equalsIgnoreCase(text(first.get("executionStatus")))) {
+                logError("mon command not Success: " + command
+                        + " -> " + text(first.get("executionStatus")));
+                return null;
+            }
+            return first.get("output");
+        } catch (final Throwable t) {
+            logError("failed to parse mon response for " + command + ": " + t);
+            return null;
+        }
+    }
+
+    /** Submits the HTTP call to the bounded pool and waits at most MonRestTimeoutSec,
+     *  retrying up to MonRestMaxRetryNum times. A timeout cancels the worker and yields
+     *  null, so the tick thread (the sole send() emitter) is never blocked. */
+    private String runMonCommand(final String command) {
+        if (httpExecutor == null) {
+            return null;
+        }
+        for (int attempt = 0; attempt <= monRestMaxRetryNum; attempt++) {
+            final Future<String> f = httpExecutor.submit(() -> httpTungsten(command));
+            try {
+                final String body = f.get(monRestTimeoutSec, TimeUnit.SECONDS);
+                if (body != null) {
+                    return body;
+                }
+            } catch (final TimeoutException te) {
+                f.cancel(true);
+                logError("mon/REST timed out after " + monRestTimeoutSec + "s: " + command);
+            } catch (final Throwable t) {
+                f.cancel(true);
+                logError("mon/REST failed: " + command + " -> " + t);
+            }
+        }
+        return null;
+    }
+
+    /** POSTs the raw command to /api/v2/tungsten with the STRIIM-TOKEN header,
+     *  authenticating on demand and re-authenticating once on a 401/403. Runs on the
+     *  bounded HTTP worker (never the tick thread). */
+    private String httpTungsten(final String command) throws Exception {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            final String tok = ensureToken();
+            if (tok == null) {
+                return null;
+            }
+            final HttpRequest req = HttpRequest.newBuilder()
+                    .version(HttpClient.Version.HTTP_1_1)
+                    .uri(URI.create(monRestBaseUrl + "/api/v2/tungsten"))
+                    .header("authorization", "STRIIM-TOKEN " + tok)
+                    .header("content-type", "text/plain")
+                    .timeout(Duration.ofSeconds(monRestTimeoutSec))
+                    .POST(HttpRequest.BodyPublishers.ofString(command))
+                    .build();
+            final HttpResponse<String> resp =
+                    httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 401 || resp.statusCode() == 403) {
+                monToken = null;   // stale token -> force re-auth on the retry
+                continue;
+            }
+            if (resp.statusCode() != 200) {
+                logError("tungsten HTTP " + resp.statusCode() + " for: " + command);
+                return null;
+            }
+            return resp.body();
+        }
+        return null;
+    }
+
+    /** Returns the cached STRIIM-TOKEN, authenticating once if absent. */
+    private String ensureToken() throws Exception {
+        final String cached = monToken;
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (tokenLock) {
+            if (monToken == null) {
+                monToken = authenticate();
+            }
+            return monToken;
+        }
+    }
+
+    /** POST /security/authenticate (form-encoded); returns the JSON {@code token}
+     *  field (per Striim's official rest-api-samples). Null on non-200 / no token. */
+    private String authenticate() throws Exception {
+        final String form = "username=" + URLEncoder.encode(monRestUser, StandardCharsets.UTF_8)
+                + "&password=" + URLEncoder.encode(monRestPassword, StandardCharsets.UTF_8);
+        final HttpRequest req = HttpRequest.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .uri(URI.create(monRestBaseUrl + "/security/authenticate"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .timeout(Duration.ofSeconds(monRestTimeoutSec))
+                .POST(HttpRequest.BodyPublishers.ofString(form))
+                .build();
+        final HttpResponse<String> resp =
+                httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            logError("mon/REST auth failed: HTTP " + resp.statusCode() + " at " + monRestBaseUrl);
+            return null;
+        }
+        final JsonNode tok = mapper.readTree(resp.body()).get("token");
+        return (tok != null && tok.isTextual()) ? tok.asText() : null;
+    }
+
+    // ---- mon/REST value parsers (values arrive as unit-bearing strings). ----
+
+    private static String text(final JsonNode n) {
+        return (n == null || n.isNull()) ? null : n.asText();
+    }
+
+    /** Parse "yyyy-MM-dd HH:mm:ss" (server-local zone) to epoch ms; null on empty/bad.
+     *  Cross-zone robustness (cluster vs agent) is deferred; see the plan. */
+    private static Long parseMonTs(final String ts) {
+        if (ts == null || ts.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return LocalDateTime.parse(ts.trim(), MON_TS_FMT)
+                    .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        } catch (final Throwable t) {
+            return null;
+        }
+    }
+
+    /** Parse a seconds value like "0.006" (or "0.008 sec"); null on empty/"Idle"/bad. */
+    private static Double parseSeconds(final String v) {
+        if (v == null) {
+            return null;
+        }
+        final String t = v.replace("sec", "").replace(",", "").trim();
+        if (t.isEmpty() || "Idle".equalsIgnoreCase(t)) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(t);
+        } catch (final NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Parse "16%" -> 16.0f; null on empty/bad. */
+    private static Float parsePercentFloat(final String v) {
+        if (v == null) {
+            return null;
+        }
+        final String t = v.replace("%", "").replace(",", "").trim();
+        if (t.isEmpty()) {
+            return null;
+        }
+        try {
+            return Float.parseFloat(t);
+        } catch (final NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Parse "3.31Gb" / "512Mb" / "2Tb" -> free memory in GB; null on empty/bad.
+     *  Unitless input is assumed GB. */
+    private static Float parseMemGb(final String v) {
+        if (v == null) {
+            return null;
+        }
+        final String t = v.replace(",", "").trim();
+        if (t.isEmpty()) {
+            return null;
+        }
+        try {
+            final String lower = t.toLowerCase();
+            final double mult;
+            final String num;
+            if (lower.endsWith("tb")) {
+                mult = 1024.0; num = lower.substring(0, lower.length() - 2);
+            } else if (lower.endsWith("gb")) {
+                mult = 1.0; num = lower.substring(0, lower.length() - 2);
+            } else if (lower.endsWith("mb")) {
+                mult = 1.0 / 1024.0; num = lower.substring(0, lower.length() - 2);
+            } else if (lower.endsWith("kb")) {
+                mult = 1.0 / 1024.0 / 1024.0; num = lower.substring(0, lower.length() - 2);
+            } else if (lower.endsWith("b")) {
+                mult = 1.0 / 1024.0 / 1024.0 / 1024.0; num = lower.substring(0, lower.length() - 1);
+            } else {
+                mult = 1.0; num = lower;
+            }
+            return (float) (Double.parseDouble(num.trim()) * mult);
+        } catch (final NumberFormatException e) {
+            return null;
+        }
     }
 
     // =====================================================================
@@ -416,13 +798,13 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         signals.add(assessLag(s.maxLagMs));
 
         // backpressure
-        signals.add(assessBackpressure(s.backpressuredComponents));
+        signals.add(assessBackpressure(s.backpressuredComponents, s.backpressureKnown));
 
         // discarded events (delta since last tick)
         signals.add(assessDiscarded(s.discardedByComponent));
 
         // node resources
-        signals.add(assessPercent("node_memory_pct", s.memoryUsedPct, memWarnPct, memFailPct, "%"));
+        signals.add(assessMemory(s));
         signals.add(assessPercent("node_cpu_pct", s.cpuPct, cpuWarnPct, cpuFailPct, "%"));
 
         // Phase 1b: OP-counter application signals. Each is assessed on its
@@ -430,9 +812,11 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         // spiking now), while the cumulative totals ride along in the signal for
         // the acceptance test to assert on exactly. A bean that is absent yields
         // UNKNOWN, never a false fault, exactly like the 1a signals.
-        signals.add(assessOpCounter("feature_miss_rate", "feature_store_miss", s,
+        signals.add(assessMlSignal("feature_miss_rate", "feature_store_miss", s,
+                streamCounters.featureMissEvents.get(), streamCounters.featureMissFaults.get(),
                 featureMissWarnPct, featureMissFailPct));
-        signals.add(assessOpCounter("nan_score_rate", "nan_score", s,
+        signals.add(assessMlSignal("nan_score_rate", "nan_score", s,
+                streamCounters.nanScoreEvents.get(), streamCounters.nanScoreFaults.get(),
                 nanScoreWarnPct, nanScoreFailPct));
 
         // Layer 2 Phase 1: upstream schema-evolution (DDL). Same cumulative-counter
@@ -533,7 +917,12 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         return signal("lag_end2end", observed, "< " + lagWarnMs + "ms", SignalState.PASS, "lag nominal");
     }
 
-    private SignalAssessment assessBackpressure(final List<String> full) {
+    private SignalAssessment assessBackpressure(final List<String> full, final boolean known) {
+        if (!known) {
+            // Not observable over the mon/REST source (no STREAM_FULL field): report
+            // UNKNOWN, never a false PASS (never infer health from what we did not check).
+            return unknown("backpressure", "not observable over the mon/REST source");
+        }
         if (full.isEmpty()) {
             return signal("backpressure", "none", "no STREAM_FULL", SignalState.PASS,
                     "no backpressured components");
@@ -590,6 +979,33 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     }
 
     /**
+     * Node memory. The JMX source provides a used-percent (assessed by threshold);
+     * the MON_REST source provides only free memory (GB), assessed as a floor (low
+     * free memory is bad, so the WARN threshold is higher than FAIL). Whichever
+     * representation the active source populated is used; neither present -> UNKNOWN.
+     */
+    private SignalAssessment assessMemory(final HealthSnapshot s) {
+        if (s.memoryUsedPct != null) {
+            return assessPercent("node_memory_pct", s.memoryUsedPct, memWarnPct, memFailPct, "%");
+        }
+        if (s.memoryFreeGb != null) {
+            final float freeGb = s.memoryFreeGb;
+            final String observed = String.format("%.2fGb free", freeGb);
+            if (freeGb <= memFreeFailGb) {
+                return signal("node_memory_free", observed, "<= " + memFreeFailGb + "Gb free",
+                        SignalState.FAIL, "node free memory critically low (" + observed + ")");
+            }
+            if (freeGb <= memFreeWarnGb) {
+                return signal("node_memory_free", observed, "<= " + memFreeWarnGb + "Gb free",
+                        SignalState.WARN, "node free memory low (" + observed + ")");
+            }
+            return signal("node_memory_free", observed, "> " + memFreeWarnGb + "Gb free",
+                    SignalState.PASS, "node free memory ok");
+        }
+        return unknown("node_memory", "no node memory metric available");
+    }
+
+    /**
      * Assesses one OP-counter signal (feature-store miss / NaN score). The
      * verdict is judged on the per-tick WINDOWED rate (faults/events since the
      * last tick) as a percent, so a spike registers immediately and a long-run
@@ -630,6 +1046,73 @@ public class ModelQualityAgent extends StriimOpenProcessor {
                 "%s window %d/%d (%.1f%%); cumulative %d/%d (%.1f%%)",
                 counterName, dFaults, dEvents, windowPct, faults, events, cumulativePct);
 
+        final SignalState state;
+        final String threshold;
+        if (windowPct >= failPct) {
+            state = SignalState.FAIL;
+            threshold = ">= " + failPct + "%";
+        } else if (windowPct >= warnPct) {
+            state = SignalState.WARN;
+            threshold = ">= " + warnPct + "%";
+        } else {
+            state = SignalState.PASS;
+            threshold = "< " + warnPct + "%";
+        }
+        return new SignalAssessment(signalName, observed, threshold, state, detail, events, faults);
+    }
+
+    /**
+     * ML signal (feature-store miss / NaN score). Week 1 moves these onto the scored
+     * stream: the STREAM-aggregated cumulative is assessed first, falling back to the
+     * in-JVM OP-counter MBean when the stream has no data this tick (e.g. a 100%-miss
+     * tick emits no scored event, so the stream counter cannot advance). MlMetricsSource
+     * = MBEAN forces the MBean. Both baselines are advanced every tick so the fallback
+     * is never stale; the chosen source is named in the signal detail.
+     */
+    private SignalAssessment assessMlSignal(final String signalName, final String counterName,
+            final HealthSnapshot s, final long streamEvents, final long streamFaults,
+            final int warnPct, final int failPct) {
+        final SignalAssessment fromStream = assessStreamCounter(signalName, counterName,
+                streamEvents, streamFaults, warnPct, failPct);
+        final SignalAssessment fromMbean = assessOpCounter(signalName, counterName, s, warnPct, failPct);
+        if ("MBEAN".equals(mlMetricsSource)) {
+            return fromMbean;
+        }
+        // STREAM (default): prefer the stream, fall back to the MBean when UNKNOWN.
+        if (fromStream.state != SignalState.UNKNOWN) {
+            return fromStream;
+        }
+        return (fromMbean.state != SignalState.UNKNOWN) ? fromMbean : fromStream;
+    }
+
+    /**
+     * Windowed rate off the stream-aggregated cumulative counters, with its own
+     * per-tick baseline. UNKNOWN when no stamped event has been seen at all, or when
+     * no NEW events advanced this tick (a total-miss tick advances nothing -> never a
+     * false PASS). Otherwise mirrors {@link #assessOpCounter}'s delta math.
+     */
+    private SignalAssessment assessStreamCounter(final String signalName, final String counterName,
+            final long events, final long faults, final int warnPct, final int failPct) {
+        if (events <= 0L) {
+            lastStreamCounter.put(counterName, new long[] { 0L, 0L });
+            return new SignalAssessment(signalName, "unknown", "n/a", SignalState.UNKNOWN,
+                    "no " + counterName + " data on the scored stream yet", null, null);
+        }
+        final long[] prev = lastStreamCounter.get(counterName);
+        final long dEvents = (prev == null) ? events : Math.max(0L, events - prev[0]);
+        final long dFaults = (prev == null) ? faults : Math.max(0L, faults - prev[1]);
+        lastStreamCounter.put(counterName, new long[] { events, faults });
+        if (dEvents <= 0L) {
+            return new SignalAssessment(signalName, "unknown", "n/a", SignalState.UNKNOWN,
+                    "no new " + counterName + " events on the scored stream this tick", events, faults);
+        }
+        final double windowPct = (double) dFaults / (double) dEvents * 100.0d;
+        final double cumulativePct = (double) faults / (double) events * 100.0d;
+        final String observed = String.format("%.1f%% this tick (%d/%d) [stream]",
+                windowPct, dFaults, dEvents);
+        final String detail = String.format(
+                "%s window %d/%d (%.1f%%); cumulative %d/%d (%.1f%%) [source=stream]",
+                counterName, dFaults, dEvents, windowPct, faults, events, cumulativePct);
         final SignalState state;
         final String threshold;
         if (windowPct >= failPct) {
@@ -829,9 +1312,26 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         if (batch == null) {
             return;
         }
-        for (final WAEvent ignored : batch) {
-            // intentionally no-op: Layer 1 senses platform state via JMX on its
-            // own timer, not from scored events.
+        // Week 1: aggregate the cumulative ML counters that ModelOp / FeatureOp stamp
+        // onto each scored event's userdata into the cross-thread holder. run() NEVER
+        // emits -- the timer is the sole send() caller (the one-writer invariant holds).
+        // The monotonic-max merge is idempotent across a batch's point-in-time stamps.
+        for (final WAEvent event : batch) {
+            final com.webaction.proc.events.WAEvent waevent =
+                    (com.webaction.proc.events.WAEvent) event.data;
+            if (waevent == null || waevent.userdata == null) {
+                continue;
+            }
+            final Long fmE = asStampLong(waevent.userdata.get("feature_miss_events_seen"));
+            final Long fmF = asStampLong(waevent.userdata.get("feature_miss_faults"));
+            if (fmE != null && fmF != null) {
+                streamCounters.mergeFeatureMiss(fmE, fmF);
+            }
+            final Long nsE = asStampLong(waevent.userdata.get("nan_score_events_seen"));
+            final Long nsF = asStampLong(waevent.userdata.get("nan_score_faults"));
+            if (nsE != null && nsF != null) {
+                streamCounters.mergeNanScore(nsE, nsF);
+            }
         }
     }
 
@@ -845,6 +1345,9 @@ public class ModelQualityAgent extends StriimOpenProcessor {
             } catch (final InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        if (httpExecutor != null) {
+            httpExecutor.shutdownNow();
         }
         log("closed");
     }
@@ -974,6 +1477,21 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         return (o instanceof Boolean) ? (Boolean) o : null;
     }
 
+    /** Coerce a userdata stamp (Number or numeric String) to Long; null otherwise. */
+    private static Long asStampLong(final Object o) {
+        if (o instanceof Number) {
+            return ((Number) o).longValue();
+        }
+        if (o instanceof String) {
+            try {
+                return Long.parseLong(((String) o).trim());
+            } catch (final NumberFormatException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     private SignalAssessment signal(final String nm, final String observed, final String threshold,
                                     final SignalState state, final String detail) {
         return new SignalAssessment(nm, observed, threshold, state, detail);
@@ -993,6 +1511,27 @@ public class ModelQualityAgent extends StriimOpenProcessor {
 
     private static boolean parseBool(final Object v, final boolean dflt) {
         return Boolean.parseBoolean(Objects.toString(v, Boolean.toString(dflt)));
+    }
+
+    private static String stripTrailingSlash(final String url) {
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    }
+
+    /** Resolves a vault-backed property of the form {@code [ns.vault.prop]}; returns
+     *  the input unchanged if it is not a vault reference. Same pattern as FeatureOp. */
+    private String getVaultProperty(final String name) {
+        try {
+            final String cleanName = name.replaceAll("[\\[\\]]", "");
+            if (cleanName.equals(name)) {
+                return name;   // not a vault reference -> literal value
+            }
+            final String[] parts = cleanName.split("\\.");
+            final String vaultId = String.format("%s.VAULT.%s", parts[0], parts[1]);
+            return new VaultAPI().getValue(vaultToken, vaultId, parts[2]).value;
+        } catch (final Exception e) {
+            logError("could not resolve vault property '" + name + "': " + e.getMessage());
+            return null;
+        }
     }
 
     private static Set<String> toUpperSet(final String csv) {
@@ -1030,8 +1569,12 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         public final List<String> backpressuredComponents = new ArrayList<>();
         public final Map<String, Long> discardedByComponent = new LinkedHashMap<>();
         public Float memoryUsedPct;
+        public Float memoryFreeGb;         // MON_REST: free memory (GB), floor-assessed
         public Float cpuPct;
         public String diskFree;
+        // Whether backpressure was observable this tick. False on the MON_REST source
+        // (no STREAM_FULL field), so backpressure reports UNKNOWN, not a false PASS.
+        public boolean backpressureKnown = true;
         // Phase 1b: application-level OP counters (feature-store miss, NaN score),
         // one entry per OpCounters.* bean discovered. Kept as one list so this
         // signal group could be re-pointed to Layer 2 later without rework.
@@ -1105,6 +1648,32 @@ public class ModelQualityAgent extends StriimOpenProcessor {
             this.component = component;
             this.eventsSeen = eventsSeen;
             this.faults = faults;
+        }
+    }
+
+    /**
+     * Week 1: cumulative ML counters carried on the scored stream (userdata),
+     * aggregated by run(). PUBLIC holder per the .scm class-loader rule (accessed
+     * across the OpenProcessorLoader / ModuleClassLoader boundary). No declared
+     * constructor, so the implicit public no-arg ctor exists for Striim's reflective
+     * instantiation of OP field classes at start. The monotonic-max merge is
+     * idempotent under out-of-order / duplicated batch reads and the run()/assess()
+     * thread split.
+     */
+    public static final class MlStreamCounters {
+        public final AtomicLong featureMissEvents = new AtomicLong();
+        public final AtomicLong featureMissFaults = new AtomicLong();
+        public final AtomicLong nanScoreEvents = new AtomicLong();
+        public final AtomicLong nanScoreFaults = new AtomicLong();
+
+        public void mergeFeatureMiss(final long events, final long faults) {
+            featureMissEvents.updateAndGet(prev -> Math.max(prev, events));
+            featureMissFaults.updateAndGet(prev -> Math.max(prev, faults));
+        }
+
+        public void mergeNanScore(final long events, final long faults) {
+            nanScoreEvents.updateAndGet(prev -> Math.max(prev, events));
+            nanScoreFaults.updateAndGet(prev -> Math.max(prev, faults));
         }
     }
 

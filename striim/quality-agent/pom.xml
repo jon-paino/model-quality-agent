@@ -9,7 +9,7 @@
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>ModelQualityAgent</name>
-    <description>Striim Open Processor: Quality Monitoring Agent, Layer 1 (Operational Health) via JMX</description>
+    <description>Striim Open Processor: Quality Monitoring Agent, Layer 1 (Operational Health) via mon/REST or JMX</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -44,6 +44,22 @@
             <version>${STRIIM_VERSION}</version>
             <scope>system</scope>
             <systemPath>${STRIIM_HOME}/lib/Common-${STRIIM_VERSION}.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>com.webaction</groupId>
+            <artifactId>SourceCommons</artifactId>
+            <version>${STRIIM_VERSION}</version>
+            <scope>system</scope>
+            <systemPath>${STRIIM_HOME}/lib/SourceCommons-${STRIIM_VERSION}.jar</systemPath>
+        </dependency>
+        <!-- hazelcast: transitive compile-time need of MDCache / VaultAPI, which
+             back the vault-resolved MonRestPassword (same as FeatureOp). -->
+        <dependency>
+            <groupId>com.hazelcast</groupId>
+            <artifactId>hazelcast-all</artifactId>
+            <version>5.3.5</version>
+            <scope>system</scope>
+            <systemPath>${STRIIM_HOME}/lib/hazelcast-5.3.5.jar</systemPath>
         </dependency>
 
         <!-- Jackson builds the MCP-ready structured assessment JSON. provided:

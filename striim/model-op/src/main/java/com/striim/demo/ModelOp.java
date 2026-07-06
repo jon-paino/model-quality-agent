@@ -670,6 +670,16 @@ public class ModelOp extends StriimOpenProcessor {
             waevent.userdata = new HashMap<>();
         }
         waevent.userdata.put(PREDICTION_KEY, prediction);
+        // Week 1: stamp the cumulative NaN-score counters onto the stream so the
+        // Quality Agent reads the nan_score_rate off the scored event (JMX-free).
+        // ModelOp always sends, so these advance on every event; recordEvent/
+        // recordFault already ran, so the cumulative is current here. nan_score flags
+        // this specific event as a NaN score.
+        waevent.userdata.put("nan_score_events_seen", nanCounter.getEventsSeen());
+        waevent.userdata.put("nan_score_faults", nanCounter.getFaults());
+        if (Float.isNaN(prediction)) {
+            waevent.userdata.put("nan_score", Boolean.TRUE);
+        }
         if (handle != null) {
             waevent.userdata.put("model_path", handle.path);
             waevent.userdata.put("model_sha256", handle.sha256);
