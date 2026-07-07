@@ -2,6 +2,7 @@
 CLAUDE.md
 reference-OPs/
 docs/
+chat-context/
 
 # Java / Maven build output. The deployable .scm is rebuilt from source against a
 # local $STRIIM_HOME (see README); it is NOT committed here (ModelOp.scm is ~41 MB).
