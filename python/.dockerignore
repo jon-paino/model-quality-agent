@@ -1,0 +1,13 @@
+# Keep the build context tiny: code + lockfiles only.
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+# Data and artifacts are runtime mounts, never image content.
+model/data
+model/artifacts
+model/feature_repo/data
+**/*.parquet
+**/*.db

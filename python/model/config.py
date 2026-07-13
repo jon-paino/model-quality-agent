@@ -2,14 +2,19 @@
 lives here so all code paths import a single source of truth.
 """
 
+import os
 from pathlib import Path
 
-# Paths (everything under model/ except the top-level repo root)
+# Paths (everything under model/ except the top-level repo root).
+# MODEL_DATA_PROCESSED / MODEL_ARTIFACTS env vars override the two locations
+# the training container must relocate (input data mount, artifact scratch);
+# unset or empty means the in-repo default, so host runs are unchanged.
 REPO_ROOT = Path(__file__).resolve().parents[1].parent
 MODEL_ROOT = Path(__file__).resolve().parent
 DATA_RAW = MODEL_ROOT / "data" / "raw"
-DATA_PROCESSED = MODEL_ROOT / "data" / "processed"
-ARTIFACTS = MODEL_ROOT / "artifacts"
+DATA_PROCESSED = Path(os.environ.get("MODEL_DATA_PROCESSED")
+                      or (MODEL_ROOT / "data" / "processed"))
+ARTIFACTS = Path(os.environ.get("MODEL_ARTIFACTS") or (MODEL_ROOT / "artifacts"))
 FEATURE_REPO = MODEL_ROOT / "feature_repo"
 
 # NYC bounding box (lon_min, lon_max, lat_min, lat_max). Loose so we keep
