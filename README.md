@@ -31,6 +31,7 @@ left behind — the OPs are rebuilt from source and the models re-exported from 
 ```
 striim/                 Striim Open Processors (Java, WAEvent pass-through) + Maven builds
   quality-agent/        ModelQualityAgent  (the monitoring agent; Layer 1 + Layer 2 Phase 1 schema signal)
+                        quality_monitor.tql: drag-and-drop standalone cross-app monitor (mon/REST, EnabledSignals)
     StriimWatcher/      field-team mon/REST collector — TRANSPORT REFERENCE for the Week 1 JMX->mon/REST pivot
   model-op/             ModelOp   (ONNX scoring + production-safe model hot-swap) + swap-test harness (test/)
   feature-op/           FeatureOp (Feast feature enrichment)

@@ -140,7 +140,11 @@ CREATE OPEN PROCESSOR HealthAgent USING Global.ModelQualityAgent (
   HealthSource: 'MON_REST',
   MonRestBaseUrl: 'http://localhost:9080',
   MonRestUser: 'admin',
-  MonRestPassword: '[qualitydemo.vault.striim_admin_pw]',
+  -- NOTE: the vault OBJECT cannot be named "vault" (reserved word in the TQL
+  -- grammar; CREATE VAULT vault fails). This cluster's vault is named
+  -- "secrets": CREATE VAULT qualitydemo.secrets; then
+  -- WRITE INTO qualitydemo.secrets ( vaultKey: "striim_admin_pw", vaultValue: "<pw>" );
+  MonRestPassword: '[qualitydemo.secrets.striim_admin_pw]',
   MonRestTimeoutSec: 5,
   -- ML signals (feature-store miss, NaN score) ride the scored stream's userdata;
   -- the OP-counter MBean is the per-tick fallback when the stream has no data.

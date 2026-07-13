@@ -1,5 +1,10 @@
 -- Quality Monitoring Agent -- Layer 1 (Operational Health).
 --
+-- NOTE (Week 2): the SUPPORTED standalone variant is now quality_monitor.tql
+-- (own namespace, senses the target cross-app over mon/REST, no cross-app
+-- stream references). This file remains the combined-app pointer and the
+-- postmortem/recovery reference for the original separate-app attempt.
+--
 -- DEFAULT PATH: Layer 1 now ships INSIDE qualitydemo.FareInference
 -- (striim/pipeline/inference_pipeline.tql). Deploy that one app and the agent
 -- comes with it, branching off ScoredStream in-scope. Use that, not this file,

@@ -185,6 +185,15 @@ import com.webaction.web.api.VaultAPI;
                 defaultValue = "false"),
         @PropertyTemplateProperty(name = "TreatYellowAsHealthy", type = Boolean.class, required = false,
                 defaultValue = "true"),
+        // ---- per-signal toggles: CSV of canonical signal names to evaluate.
+        // "ALL" (default) keeps every signal on. Per-component signals
+        // (source_freshness[X], target_write_age[Y]) match their base name;
+        // node_memory is one logical toggle regardless of transport (it covers
+        // node_memory_pct and node_memory_free) and node_cpu covers node_cpu_pct.
+        // Unknown names are logged and ignored; disabled signals are omitted from
+        // the assessment and never influence the verdict or the breaker. ----
+        @PropertyTemplateProperty(name = "EnabledSignals", type = String.class, required = false,
+                defaultValue = "ALL"),
         @PropertyTemplateProperty(name = "EnableLogging", type = Boolean.class, required = false,
                 defaultValue = "true")
 }, outputType = com.webaction.proc.events.WAEvent.class,
@@ -200,6 +209,15 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     // two loaders (IllegalAccessError). Same rule the probe confirmed for MBeans.
     public enum Verdict { GREEN, YELLOW, RED, UNKNOWN }
     public enum SignalState { PASS, WARN, FAIL, UNKNOWN }
+
+    // ---- per-signal toggle vocabulary (EnabledSignals). One token per signal
+    // family; the CSV is the single source of truth and doubles as the canonical
+    // order for disabled_signals and for the unknown-token error message. ----
+    private static final String KNOWN_SIGNALS_CSV =
+            "app_status,source_freshness,target_write_age,lag_end2end,backpressure,"
+                    + "discarded_events,node_memory,node_cpu,feature_miss_rate,nan_score_rate,"
+                    + "schema_evolution";
+    private static final Set<String> KNOWN_SIGNALS = Set.of(KNOWN_SIGNALS_CSV.split(","));
 
     // ---- configuration (the agent's policy), loaded in start() ----
     private String ns;
@@ -220,6 +238,8 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     private boolean backpressureIsFail;
     private boolean treatYellowAsHealthy;
     private boolean enableLogging;
+    private Set<String> enabledSignals;      // null means ALL (no filtering)
+    private List<String> disabledSignals = java.util.Collections.emptyList();
 
     // ---- transport (mon/REST) config ----
     private String healthSource;             // "JMX" | "MON_REST"
@@ -303,6 +323,7 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         backpressureIsFail = parseBool(p.get("BackpressureIsFail"), false);
         treatYellowAsHealthy = parseBool(p.get("TreatYellowAsHealthy"), true);
         enableLogging = parseBool(p.get("EnableLogging"), true);
+        parseEnabledSignals(p.get("EnabledSignals"));
 
         // ---- transport (mon/REST) ----
         healthSource = Objects.toString(p.get("HealthSource"), "MON_REST").trim().toUpperCase();
@@ -349,7 +370,8 @@ public class ModelQualityAgent extends StriimOpenProcessor {
 
         log("started: watching " + fqApp + " via " + healthSource + " ("
                 + ("MON_REST".equals(healthSource) ? monRestBaseUrl : jmxDomain)
-                + ") every " + tickIntervalSec + "s");
+                + ") every " + tickIntervalSec + "s; signals="
+                + (enabledSignals == null ? "ALL" : enabledSignals));
     }
 
     /** One perceive -> assess -> act cycle, guarded so the loop never dies. */
@@ -773,56 +795,83 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     private Assessment assess(final HealthSnapshot s) {
         final List<SignalAssessment> signals = new ArrayList<>();
 
+        // Each signal family is gated by its EnabledSignals toggle. A disabled
+        // signal is OMITTED entirely (it is operator policy, recorded once per
+        // assessment in disabled_signals, not a pseudo-signal re-asserted every
+        // tick), so the rollup and the emitted counts see enabled signals only.
+
         // app_status
-        signals.add(assessAppStatus(s.appStatus));
+        if (isEnabled("app_status")) {
+            signals.add(assessAppStatus(s.appStatus));
+        }
 
         // source freshness (one signal per source; worst rolls up)
-        for (final ComponentTime c : s.sources) {
-            signals.add(assessFreshness("source_freshness[" + c.name + "]", c.lastMs,
-                    s.tickTs, sourceWarnMs, sourceFailMs, "last event"));
-        }
-        if (s.sources.isEmpty()) {
-            signals.add(unknown("source_freshness", "no Source health beans found for " + ns));
+        if (isEnabled("source_freshness")) {
+            for (final ComponentTime c : s.sources) {
+                signals.add(assessFreshness("source_freshness[" + c.name + "]", c.lastMs,
+                        s.tickTs, sourceWarnMs, sourceFailMs, "last event"));
+            }
+            if (s.sources.isEmpty()) {
+                signals.add(unknown("source_freshness", "no Source health beans found for " + ns));
+            }
         }
 
         // target write freshness
-        for (final ComponentTime c : s.targets) {
-            signals.add(assessFreshness("target_write_age[" + c.name + "]", c.lastMs,
-                    s.tickTs, targetWarnMs, targetFailMs, "last write"));
-        }
-        if (s.targets.isEmpty()) {
-            signals.add(unknown("target_write_age", "no Target health beans found for " + ns));
+        if (isEnabled("target_write_age")) {
+            for (final ComponentTime c : s.targets) {
+                signals.add(assessFreshness("target_write_age[" + c.name + "]", c.lastMs,
+                        s.tickTs, targetWarnMs, targetFailMs, "last write"));
+            }
+            if (s.targets.isEmpty()) {
+                signals.add(unknown("target_write_age", "no Target health beans found for " + ns));
+            }
         }
 
         // end-to-end lag
-        signals.add(assessLag(s.maxLagMs));
+        if (isEnabled("lag_end2end")) {
+            signals.add(assessLag(s.maxLagMs));
+        }
 
         // backpressure
-        signals.add(assessBackpressure(s.backpressuredComponents, s.backpressureKnown));
+        if (isEnabled("backpressure")) {
+            signals.add(assessBackpressure(s.backpressuredComponents, s.backpressureKnown));
+        }
 
         // discarded events (delta since last tick)
-        signals.add(assessDiscarded(s.discardedByComponent));
+        if (isEnabled("discarded_events")) {
+            signals.add(assessDiscarded(s.discardedByComponent));
+        }
 
         // node resources
-        signals.add(assessMemory(s));
-        signals.add(assessPercent("node_cpu_pct", s.cpuPct, cpuWarnPct, cpuFailPct, "%"));
+        if (isEnabled("node_memory")) {
+            signals.add(assessMemory(s));
+        }
+        if (isEnabled("node_cpu")) {
+            signals.add(assessPercent("node_cpu_pct", s.cpuPct, cpuWarnPct, cpuFailPct, "%"));
+        }
 
         // Phase 1b: OP-counter application signals. Each is assessed on its
         // per-tick windowed rate (the operational signal: is the miss/NaN rate
         // spiking now), while the cumulative totals ride along in the signal for
         // the acceptance test to assert on exactly. A bean that is absent yields
         // UNKNOWN, never a false fault, exactly like the 1a signals.
-        signals.add(assessMlSignal("feature_miss_rate", "feature_store_miss", s,
-                streamCounters.featureMissEvents.get(), streamCounters.featureMissFaults.get(),
-                featureMissWarnPct, featureMissFailPct));
-        signals.add(assessMlSignal("nan_score_rate", "nan_score", s,
-                streamCounters.nanScoreEvents.get(), streamCounters.nanScoreFaults.get(),
-                nanScoreWarnPct, nanScoreFailPct));
+        if (isEnabled("feature_miss_rate")) {
+            signals.add(assessMlSignal("feature_miss_rate", "feature_store_miss", s,
+                    streamCounters.featureMissEvents.get(), streamCounters.featureMissFaults.get(),
+                    featureMissWarnPct, featureMissFailPct));
+        }
+        if (isEnabled("nan_score_rate")) {
+            signals.add(assessMlSignal("nan_score_rate", "nan_score", s,
+                    streamCounters.nanScoreEvents.get(), streamCounters.nanScoreFaults.get(),
+                    nanScoreWarnPct, nanScoreFailPct));
+        }
 
         // Layer 2 Phase 1: upstream schema-evolution (DDL). Same cumulative-counter
         // -> per-tick delta pattern as discarded_events, applied to the source's
         // DDL count, capped at WARN (alert + verdict only; no circuit breaker).
-        signals.add(assessSchemaEvolution(s));
+        if (isEnabled("schema_evolution")) {
+            signals.add(assessSchemaEvolution(s));
+        }
 
         // Roll up: RED if any FAIL, else YELLOW if any WARN, else GREEN. UNKNOWN
         // signals never force RED (defensive: missing data is not a fault).
@@ -1182,7 +1231,11 @@ public class ModelQualityAgent extends StriimOpenProcessor {
             return sb.toString();
         }
         if (v == Verdict.UNKNOWN) {
-            sb.append("No signals could be read (JMX may be disabled or the app is not deployed).");
+            if (signals.isEmpty() && !disabledSignals.isEmpty()) {
+                sb.append("All signals are disabled via EnabledSignals.");
+            } else {
+                sb.append("No signals could be read (JMX may be disabled or the app is not deployed).");
+            }
             return sb.toString();
         }
         sb.append(fail).append(" failing, ").append(warn).append(" warning. ");
@@ -1264,6 +1317,11 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         m.put("fail_count", a.failCount);
         m.put("warn_count", a.warnCount);
         m.put("rationale", a.rationale);
+        // Operator policy, recorded once per assessment: signal families turned
+        // off via EnabledSignals (canonical order). Absent when everything is on.
+        if (!disabledSignals.isEmpty()) {
+            m.put("disabled_signals", disabledSignals);
+        }
         final List<Map<String, Object>> sigs = new ArrayList<>();
         for (final SignalAssessment sa : a.signals) {
             final Map<String, Object> sm = new LinkedHashMap<>();
@@ -1501,6 +1559,12 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         return new SignalAssessment(nm, "unknown", "n/a", SignalState.UNKNOWN, detail);
     }
 
+    /** Per-signal toggle check: each assess() call site is gated by its base
+     *  toggle name (a KNOWN_SIGNALS token); null means ALL (no filtering). */
+    private boolean isEnabled(final String signalToggle) {
+        return enabledSignals == null || enabledSignals.contains(signalToggle);
+    }
+
     private static int parseInt(final Object v, final int dflt) {
         try {
             return Integer.parseInt(Objects.toString(v, Integer.toString(dflt)).trim());
@@ -1532,6 +1596,50 @@ public class ModelQualityAgent extends StriimOpenProcessor {
             logError("could not resolve vault property '" + name + "': " + e.getMessage());
             return null;
         }
+    }
+
+    /** Parses the EnabledSignals CSV into the toggle set. null means ALL (no
+     *  filtering); "ALL" as any token restores it. Unknown tokens are logged and
+     *  ignored, never a throw; the surviving set is honored EVEN IF EMPTY. An
+     *  all-disabled agent reads a loud UNKNOWN (rationale names EnabledSignals,
+     *  breaker closed); failing open to ALL instead could open the breaker on
+     *  signals the operator explicitly tried to disable. */
+    private void parseEnabledSignals(final Object raw) {
+        final String csv = Objects.toString(raw, "ALL").trim();
+        enabledSignals = null;
+        disabledSignals = java.util.Collections.emptyList();
+        if (csv.isEmpty()) {
+            return;
+        }
+        final Set<String> valid = new java.util.HashSet<>();
+        boolean sawToken = false;
+        for (final String s : csv.split(",")) {
+            final String t = s.trim().toLowerCase();
+            if (t.isEmpty()) {
+                continue;
+            }
+            sawToken = true;
+            if ("all".equals(t)) {
+                return;   // ALL anywhere in the CSV means no filtering
+            }
+            if (KNOWN_SIGNALS.contains(t)) {
+                valid.add(t);
+            } else {
+                logError("EnabledSignals: unknown signal '" + t + "' ignored (known: "
+                        + KNOWN_SIGNALS_CSV + ", or ALL)");
+            }
+        }
+        if (!sawToken) {
+            return;   // delimiter-only CSV (e.g. ','): no tokens expressed, keep ALL
+        }
+        enabledSignals = java.util.Collections.unmodifiableSet(valid);
+        final List<String> off = new ArrayList<>();
+        for (final String t : KNOWN_SIGNALS_CSV.split(",")) {
+            if (!valid.contains(t)) {
+                off.add(t);
+            }
+        }
+        disabledSignals = java.util.Collections.unmodifiableList(off);
     }
 
     private static Set<String> toUpperSet(final String csv) {

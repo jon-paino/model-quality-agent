@@ -1,0 +1,152 @@
+-- ===================================================================
+-- Standalone Quality Monitor (drag-and-drop, cross-app over mon/REST).
+--
+-- Monitors ANY running Striim app (default: qualitydemo.FareInference) from
+-- its OWN application and namespace. There are NO cross-app stream
+-- references: the agent senses the target over Striim's mon-command REST API
+-- every TickIntervalSec and emits one health assessment per tick, independent
+-- of event flow. (The old separate-app attempt failed ONLY because it did
+-- FROM qualitydemo.ScoredStream; see quality_agent.tql. This template
+-- declares its own input stream instead.)
+--
+-- To point the monitor at a different app, edit TargetNamespace and
+-- TargetAppName below. To choose which signals are assessed, edit
+-- EnabledSignals (CSV of: app_status, source_freshness, target_write_age,
+-- lag_end2end, backpressure, discarded_events, node_memory, node_cpu,
+-- feature_miss_rate, nan_score_rate, schema_evolution; or ALL).
+--
+-- Prerequisites:
+--   1. LOAD OPEN PROCESSOR 'UploadedFiles/ModelQualityAgent.scm';
+--   2. The MONITORED app (default qualitydemo.FareInference) deployed and
+--      running.
+--   3. mon/REST reachable at MonRestBaseUrl; MonRestPassword resolvable (the
+--      vault reference below, or a plaintext value for local dev only).
+--
+-- Deploy:
+--   /opt/Striim/bin/console.sh -c <WAClusterName> -u admin -p '<pw>' \
+--       -f striim/quality-agent/quality_monitor.tql
+-- (WAClusterName is in conf/startUp.properties, NOT the $USER default. The
+--  trailing quit; makes console.sh -f exit instead of dropping to the prompt.)
+--
+-- Re-run cleanup (uncomment to reset):
+-- STOP APPLICATION qualitymon.QualityMonitorApp;
+-- UNDEPLOY APPLICATION qualitymon.QualityMonitorApp;
+-- DROP APPLICATION qualitymon.QualityMonitorApp CASCADE;
+-- use admin;
+-- DROP NAMESPACE qualitymon CASCADE;
+-- ===================================================================
+
+CREATE NAMESPACE qualitymon;
+USE qualitymon;
+
+CREATE APPLICATION QualityMonitorApp;
+
+-- Input stream: exists ONLY to satisfy OP wiring (FROM). Nothing feeds it by
+-- design; the agent is timer-driven and run() is only used for the ML STREAM
+-- counters, which are off in this template. If DEPLOY rejects an app whose
+-- stream has no producer, uncomment the HeartbeatSource fallback below: its
+-- wildcard matches no file, so it never reads anything, it just gives the
+-- flow graph a source.
+CREATE STREAM MonitorHeartbeatStream OF Global.WAEvent;
+
+-- FALLBACK (uncomment only if the unfed-stream deploy fails):
+-- CREATE SOURCE HeartbeatSource USING Global.FileReader (
+--   directory: 'UploadedFiles',
+--   wildcard: 'qualitymon_heartbeat*.csv',
+--   positionByEOF: false
+-- )
+-- PARSE USING Global.DSVParser ( header: false, columndelimiter: ',' )
+-- OUTPUT TO MonitorHeartbeatStream;
+
+CREATE STREAM QualityAssessmentStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR QualityMonitor USING Global.ModelQualityAgent (
+  -- WHO to monitor (cross-app, sensed over mon/REST). Edit these two lines to
+  -- point the monitor at any other app:
+  TargetNamespace: 'qualitydemo',
+  TargetAppName: 'FareInference',
+  TickIntervalSec: 30,
+  HealthSource: 'MON_REST',
+  MonRestBaseUrl: 'http://localhost:9080',
+  MonRestUser: 'admin',
+  -- Vault reference (same entry inference_pipeline.tql uses; the vault object
+  -- cannot be named "vault", a TQL reserved word, hence "secrets"). A
+  -- plaintext value works for local dev but must not be committed.
+  MonRestPassword: '[qualitydemo.secrets.striim_admin_pw]',
+  MonRestTimeoutSec: 5,
+  -- Generic platform signal set: the families every Striim app has.
+  -- backpressure and discarded_events read UNKNOWN over mon/REST by design
+  -- (never a false PASS); they stay enabled for honest visibility.
+  EnabledSignals: 'app_status,source_freshness,target_write_age,lag_end2end,backpressure,discarded_events,node_memory,node_cpu',
+  -- ML + schema signals are OFF above (not in EnabledSignals). To monitor an
+  -- ML pipeline from this standalone app, append
+  -- ',feature_miss_rate,nan_score_rate,schema_evolution' to EnabledSignals
+  -- and uncomment the block below. MlMetricsSource MBEAN works cross-app when
+  -- the monitored app runs in the SAME JVM (the OpCounter MBeans are
+  -- JVM-global); STREAM requires the agent to live INSIDE the monitored app
+  -- on its scored stream (that variant is inference_pipeline.tql).
+  -- MlMetricsSource: 'MBEAN',
+  -- FeatureMissRateWarnPct: 5,
+  -- FeatureMissRateFailPct: 20,
+  -- NanScoreRateWarnPct: 5,
+  -- NanScoreRateFailPct: 20,
+  -- DdlWarnDelta: 1,
+  -- policy (thresholds); override per environment:
+  SourceFreshnessWarnSec: 60,
+  SourceFreshnessFailSec: 300,
+  TargetWriteWarnSec: 60,
+  TargetWriteFailSec: 300,
+  LagWarnMs: 5000,
+  LagFailMs: 30000,
+  -- MON_REST free-memory floor (GB): the mon/REST source exposes free memory,
+  -- not a used-percent, so node_memory is judged as "WARN/FAIL when free
+  -- drops below X GB".
+  MemoryFreeWarnGb: 2,
+  MemoryFreeFailGb: 1,
+  CpuWarnPct: 85,
+  CpuFailPct: 95,
+  EnableLogging: true
+)
+INSERT INTO QualityAssessmentStream
+FROM MonitorHeartbeatStream;
+
+-- Live view of every assessment tick (renders userdata: verdict + rationale).
+CREATE TARGET QualitySysOut USING Global.SysOut (
+  name: 'QualityMonitor'
+)
+INPUT FROM QualityAssessmentStream;
+
+-- Capturable output: project the assessment's positional data[] into named
+-- fields (a formatter cannot read userdata). See the data[] output contract
+-- in ModelQualityAgent.act().
+CREATE CQ FormatQuality
+INSERT INTO QualityOutStream
+SELECT
+  TO_STRING(data[0]) AS tick_ts,
+  TO_STRING(data[1]) AS verdict,
+  TO_STRING(data[2]) AS ops_healthy,
+  TO_STRING(data[3]) AS ops_circuit_breaker_open,
+  TO_STRING(data[4]) AS rationale,
+  TO_STRING(data[5]) AS signal_count,
+  TO_STRING(data[6]) AS fail_count,
+  TO_STRING(data[7]) AS warn_count,
+  TO_STRING(data[8]) AS assessment_json,
+  TO_STRING(data[9]) AS target_app
+FROM QualityAssessmentStream;
+
+-- One JSON record per tick. DISTINCT filename from the in-app agent's
+-- health_assessments.json so both can run side by side and the acceptance
+-- scripts never read each other's output.
+CREATE TARGET QualityFileSink USING Global.FileWriter (
+  directory: 'UploadedFiles',
+  filename: 'quality_monitor_assessments.json'
+)
+FORMAT USING Global.JSONFormatter ()
+INPUT FROM QualityOutStream;
+
+END APPLICATION QualityMonitorApp;
+
+DEPLOY APPLICATION qualitymon.QualityMonitorApp;
+START APPLICATION qualitymon.QualityMonitorApp;
+
+quit;
