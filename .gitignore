@@ -42,3 +42,6 @@ python/model/data/
 
 # Logs
 *.log
+
+# Retrain trigger runtime artifacts (state, lock, audit log)
+striim/retrain/state/
