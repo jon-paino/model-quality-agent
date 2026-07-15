@@ -1,0 +1,60 @@
+{
+  "version": "2.0",
+  "target": "fare_amount",
+  "geohash_precision": 6,
+  "short_window_min": 10,
+  "long_window_min": 60,
+  "feature_order": [
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "trip_distance",
+    "passenger_count",
+    "trip_count_last_10min",
+    "trip_count_last_1hr",
+    "trip_count_last_4hr",
+    "trip_count_last_24hr",
+    "avg_fare_last_1hr",
+    "unique_dropoff_zones_last_1hr",
+    "cell_active_minutes_last_1hr",
+    "trip_count_delta_10min",
+    "trip_count_same_hour_yesterday",
+    "trip_count_same_hour_last_week"
+  ],
+  "event_features": [
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "trip_distance",
+    "passenger_count"
+  ],
+  "dynamic_features": [
+    "trip_count_last_10min",
+    "trip_count_last_1hr",
+    "trip_count_last_4hr",
+    "trip_count_last_24hr",
+    "avg_fare_last_1hr",
+    "unique_dropoff_zones_last_1hr",
+    "cell_active_minutes_last_1hr",
+    "trip_count_delta_10min",
+    "trip_count_same_hour_yesterday",
+    "trip_count_same_hour_last_week"
+  ],
+  "feature_dtypes": {
+    "hour_of_day": "float32",
+    "day_of_week": "float32",
+    "is_weekend": "float32",
+    "trip_distance": "float32",
+    "passenger_count": "float32",
+    "trip_count_last_10min": "float32",
+    "trip_count_last_1hr": "float32",
+    "trip_count_last_4hr": "float32",
+    "trip_count_last_24hr": "float32",
+    "avg_fare_last_1hr": "float32",
+    "unique_dropoff_zones_last_1hr": "float32",
+    "cell_active_minutes_last_1hr": "float32",
+    "trip_count_delta_10min": "float32",
+    "trip_count_same_hour_yesterday": "float32",
+    "trip_count_same_hour_last_week": "float32"
+  }
+}
