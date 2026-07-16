@@ -25,6 +25,12 @@ Publish REFUSES (exit 1, nothing written) unless every gate passes:
      gates, see the constants below);
   6. metrics.json parses and carries eval.point_adjusted_last_point.f1.
 
+After the atomic file publish succeeds, the combo's scoring params are pushed
+to the Feast online store (F2) with the just-published model_version, so the
+FCVAEParamsOp serves params matching the new live handle. A failed push only
+WARNs (the files are already published); `--require-feast` upgrades it to
+exit 3.
+
 Entry point: `uv run python -m fcvae.publish run --model <name>`.
 The default `--out` honors the FCVAE_PUBLISH_OUT env var, else the artifacts
 dir (taxi convention).
@@ -89,7 +95,8 @@ def _write_tmp(path: Path, data: bytes) -> Path:
     return Path(tmp)
 
 
-def publish(model_name: str, artifacts_dir: Path, out_dir: Path) -> None:
+def publish(model_name: str, artifacts_dir: Path, out_dir: Path,
+            require_feast: bool = False) -> None:
     """Gate the artifacts, build the manifest, publish atomically to out_dir."""
     onnx_path = artifacts_dir / MODEL_FILE_NAME
     config_path = artifacts_dir / MODEL_CONFIG_NAME
@@ -230,6 +237,22 @@ def publish(model_name: str, artifacts_dir: Path, out_dir: Path) -> None:
                f"(parity max abs err {parity_metrics['max_abs_diff']:.2e}, "
                f"{n_golden} golden windows, pa_f1={pa_f1:.4f})")
 
+    # F2: mirror the fresh publish into the Feast online store so the params
+    # OP serves params matching the just-published version. The files above
+    # are already on disk, so a Feast failure must not un-publish them: it
+    # WARNs (exit unchanged) unless --require-feast, which exits 3.
+    try:
+        from .feast_setup import push_params
+        pushed = push_params(model_name, out_dir,
+                             {"model_version": manifest["model_version"]})
+        click.echo("[feast push] " + json.dumps(pushed))
+    except Exception as e:
+        if require_feast:
+            click.echo(f"ERROR: feast push failed: {e} (the model files WERE already "
+                       f"published to {out_dir}; re-push with `fcvae.feast_setup push`)")
+            sys.exit(3)
+        click.echo(f"WARN: feast push failed: {e}")
+
 
 @click.group()
 def cli() -> None:
@@ -245,13 +268,16 @@ def cli() -> None:
               default=lambda: os.environ.get("FCVAE_PUBLISH_OUT") or None,
               help="Publish target directory (the path the scorer OP watches for a "
                    "live deploy). Default: $FCVAE_PUBLISH_OUT or the artifacts dir.")
-def cmd_run(model_name: str, artifacts_dir: Path, out_dir: Path) -> None:
+@click.option("--require-feast", is_flag=True, default=False,
+              help="Exit 3 if the post-publish Feast push fails (the files are "
+                   "published either way).")
+def cmd_run(model_name: str, artifacts_dir: Path, out_dir: Path, require_feast: bool) -> None:
     """Gate (presence, signature, config, golden, parity, eval), then publish atomically."""
     if artifacts_dir is None:
         artifacts_dir = ARTIFACTS / model_name
     if out_dir is None:   # no --out and no FCVAE_PUBLISH_OUT: the artifacts dir
         out_dir = artifacts_dir
-    publish(model_name, artifacts_dir, out_dir)
+    publish(model_name, artifacts_dir, out_dir, require_feast=require_feast)
 
 
 if __name__ == "__main__":

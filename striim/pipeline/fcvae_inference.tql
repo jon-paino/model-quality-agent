@@ -1,7 +1,21 @@
 -- Vendored from fcvae-anomaly-detection striim/FCVAE_ONNX.tql
 -- (branch onnx-hybrid-passthrough, commit 9575ba5), REWIRED FOR F1:
--- namespace fcvaedemo / app PennyInference, hot-swap scorer (ControlFile),
--- feed dir /tmp/fcvae_swap_test, scored JSON in /opt/Striim/UploadedFiles.
+-- namespace fcvaedemo, hot-swap scorer (ControlFile), feed dir
+-- /tmp/fcvae_swap_test, scored JSON in /opt/Striim/UploadedFiles.
+-- REWIRED AGAIN FOR F2:
+--   - app renamed fcvaedemo.PennyInference -> fcvaedemo.FcvaeInference;
+--   - the shared parse CQ also projects network_type (data[1]) and
+--     transaction_type (data[2]) so per-combo chains can filter;
+--   - a Feast params OP (Global.FCVAEParamsOp) sits between each combo's
+--     createWAEvent stream and its scorer, stamping fcvae_* scoring params
+--     into userdata from the Feast online store at http://127.0.0.1:6567
+--     (LENIENT: any miss/timeout stamps nothing and the event still flows;
+--     the scorer then falls back to the swap-paired model_config);
+--   - a second, MIRRORED Accel_CMP chain (network_type 'Accel' AND
+--     transaction_type 'CMP', NO amount filter: the combo series counts ALL
+--     of that combo's transactions) scores with its own model bundle in
+--     /opt/Striim/fcvae-models/Accel_CMP and writes fcvae_accel*.json
+--     (fcvae_scored* and fcvae_accel* are deliberately DISJOINT globs).
 -- Requires the WAEUdf SE add-on jar in $STRIIM_HOME/lib.
 --
 -- Deployed by striim/pipeline/deploy_fcvae.sh via console.sh -f (absolute
@@ -9,44 +23,53 @@
 -- namespace, so this file may assume the namespace does NOT exist.
 
 -- ============================================================================
--- FCVAE PENNY (ONNX): in-process penny-carding anomaly detection (F1 wiring)
+-- FCVAE INFERENCE (ONNX): in-process anomaly detection, two chains (F2 wiring)
 --
--- Penny-carding use case: a single pooled FCVAE model ("Penny_All") scores the
--- hourly frequency of penny transactions (amount < $1), running INSIDE the
--- Striim JVM via ONNX Runtime. In-process ONNX replaces the FastAPI HTTP sidecar.
+-- Penny chain: a single pooled FCVAE model ("Penny_All") scores the hourly
+-- frequency of penny transactions (amount < $1). Accel chain: the Accel_CMP
+-- combo model scores the hourly frequency of ALL Accel/CMP transactions.
+-- Both run INSIDE the Striim JVM via ONNX Runtime.
 --
--- Windowing stays in Striim CQs (penny filter -> hourly count -> 24-row window).
--- The assembled 24-hour row is then converted to a Global.WAEvent with the
--- WAEUdf createWAEvent UDF, so the scorer can be a pure WAEvent pass-through
--- Open Processor wired DIRECTLY in TQL. No types JAR, no JAR-removal trick, no
--- Flow Designer. One CREATE TYPE (for the createWAEvent payload) is required.
+-- Windowing stays in Striim CQs (per-chain filter -> hourly count -> 24-row
+-- window). The assembled 24-hour row is converted to a Global.WAEvent with the
+-- WAEUdf createWAEvent UDF, so params OP and scorer are pure WAEvent
+-- pass-through Open Processors wired DIRECTLY in TQL. No types JAR, no
+-- JAR-removal trick, no Flow Designer. One CREATE TYPE (for the createWAEvent
+-- payload) is required.
 --
 -- F1 additions over the vendored form:
 --   - hot-swap scorer: the OP watches ModelDir/model.onnx (mtime gate, sha
 --     compare, signature gate) and ControlFile for rollback commands, so a
 --     republished model deploys with zero pipeline downtime;
---   - the feed dir is /tmp/fcvae_swap_test (the F1 acceptance harness feeds
+--   - the feed dir is /tmp/fcvae_swap_test (the acceptance harnesses feed
 --     penny_feed_s<shift>.csv files there);
---   - scored output lands in /opt/Striim/UploadedFiles/fcvae_scored*.json so
---     the harness can snapshot/compare predictions.
+--   - scored output lands in /opt/Striim/UploadedFiles so the harnesses can
+--     snapshot/compare predictions.
 --
 -- PREREQUISITES (the deploy script handles 2 and 3):
 --   1. WAEUdf library JAR in $STRIIM_HOME/lib/ and Striim restarted.
 --        (SE add-on; see https://webaction.atlassian.net/wiki/spaces/SE/pages/2318336001 )
 --        Confirm: the class com.webaction.helpers.WAEUdf is on the classpath.
---   2. Build + stage the OP:  striim/fcvae-scorer/build.sh
---   3. Load it:               LOAD OPEN PROCESSOR 'UploadedFiles/FCVAEOnnxScorer.scm';
---   4. Penny model bundle in  /opt/Striim/fcvae-models/Penny_All/
---        (model.onnx + model_config.json, published by python -m fcvae.publish)
---   5. Penny transactions CSV in /tmp/fcvae_swap_test/
+--   2. Build + stage BOTH OPs:  striim/fcvae-scorer/build.sh
+--                               striim/fcvae-params-op/build.sh
+--   3. Load them:  LOAD OPEN PROCESSOR 'UploadedFiles/FCVAEOnnxScorer.scm';
+--                  LOAD OPEN PROCESSOR 'UploadedFiles/FCVAEParamsOp.scm';
+--   4. Model bundles (model.onnx + model_config.json, published by
+--      python -m fcvae.publish) in  /opt/Striim/fcvae-models/Penny_All/
+--                              and  /opt/Striim/fcvae-models/Accel_CMP/
+--   5. Transactions CSV in /tmp/fcvae_swap_test/
+--   6. (Optional) the second Feast instance serving on 127.0.0.1:6567
+--      (python -m fcvae.feast_setup serve). If it is down, the params OPs
+--      stamp nothing and the scorers use their config fallback.
 -- ============================================================================
 
 CREATE NAMESPACE fcvaedemo;
 USE fcvaedemo;
 
 -- Striim type for the createWAEvent payload (5 fields -> data[0..4]). All String
--- so the data[] array is uniform; the OP reads each value as a string.
-CREATE TYPE PennyPayloadType (
+-- so the data[] array is uniform; the OPs read each value as a string. Shared
+-- by both chains.
+CREATE TYPE FcvaePayloadType (
   combo_key    String,
   values_list  String,
   window_size  String,
@@ -54,13 +77,13 @@ CREATE TYPE PennyPayloadType (
   window_end   String
 );
 
-CREATE APPLICATION PennyInference;
+CREATE APPLICATION FcvaeInference;
 
 -- ----------------------------------------------------------------------------
--- Ingest raw transaction rows from CSV (own input dir for isolation).
+-- SHARED: ingest raw transaction rows from CSV (own input dir for isolation).
 -- Columns: timestamp,network_type,transaction_type,amount,is_anomaly,penny_is_anomaly,split
 -- ----------------------------------------------------------------------------
-CREATE SOURCE PennyTxnFileSource USING FileReader (
+CREATE SOURCE TxnFileSource USING FileReader (
   directory: '/tmp/fcvae_swap_test',
   wildcard: 'penny_feed*.csv',
   positionByEOF: false
@@ -69,29 +92,33 @@ PARSE USING DSVParser (
   columndelimiter: ',',
   header: true
 )
-OUTPUT TO PennyRawTxnStream;
+OUTPUT TO RawTxnStream;
 
 -- ----------------------------------------------------------------------------
--- Parse timestamp (data[0]) and amount (data[3]) from the raw WAEvent
+-- SHARED: parse timestamp, network_type, transaction_type and amount from the
+-- raw WAEvent. Both chains filter off this one stream.
 -- ----------------------------------------------------------------------------
-CREATE CQ PennyParseTxn
-INSERT INTO PennyParsedStream
+CREATE CQ ParseTxn
+INSERT INTO ParsedTxnStream
 SELECT
   TO_DATEF(SLEFT(TO_STRING(data[0]), 19),
            'yyyy-MM-dd HH:mm:ss')   AS txn_timestamp,
+  TO_STRING(data[1])                AS network_type,
+  TO_STRING(data[2])                AS transaction_type,
   TO_DOUBLE(TO_STRING(data[3]))     AS amount
-FROM PennyRawTxnStream;
+FROM RawTxnStream;
 
--- ----------------------------------------------------------------------------
--- Filter to penny transactions only (amount < $1.00). All networks/types are
--- pooled into a single "Penny_All" key (single-model use case).
--- ----------------------------------------------------------------------------
+-- ============================================================================
+-- PENNY CHAIN (combo_key 'Penny_All'): penny transactions only (amount < $1),
+-- all networks/types pooled into the single pooled model.
+-- ============================================================================
+
 CREATE CQ PennyFilter
 INSERT INTO PennyFilteredStream
 SELECT
   'Penny_All'    AS combo_key,
   txn_timestamp  AS txn_timestamp
-FROM PennyParsedStream
+FROM ParsedTxnStream
 WHERE amount < 1.00;
 
 -- ----------------------------------------------------------------------------
@@ -135,7 +162,7 @@ HAVING COUNT(*) >= 24;
 
 -- ----------------------------------------------------------------------------
 -- Convert the typed payload row to a Global.WAEvent via the WAEUdf library, so
--- the pass-through OP can consume it. The 5 fields land positionally in data[]:
+-- the pass-through OPs can consume it. The 5 fields land positionally in data[]:
 --   data[0]=combo_key  data[1]=values_list  data[2]=window_size
 --   data[3]=window_start  data[4]=window_end
 -- ----------------------------------------------------------------------------
@@ -144,13 +171,28 @@ CREATE STREAM PennyDailyPayloadStream OF Global.WAEvent;
 CREATE CQ PennyToWaevent
 INSERT INTO PennyDailyPayloadStream
 SELECT com.webaction.helpers.WAEUdf.createWAEvent(
-  'fcvaedemo.PennyPayloadType',
+  'fcvaedemo.FcvaePayloadType',
   'Penny_All',
   'INSERT',
   java.util.Arrays.asList(p.combo_key, p.values_list, p.window_size, p.window_start, p.window_end).toArray(),
   java.util.Arrays.asList(p.combo_key, p.values_list, p.window_size, p.window_start, p.window_end).toArray()
 )
 FROM PennyDailyPayloadTyped p;
+
+-- ----------------------------------------------------------------------------
+-- F2: enrich the payload with Feast-served scoring params (userdata only, the
+-- data[] contract is untouched). LENIENT: a Feast miss/timeout stamps nothing
+-- and the event still flows to the scorer, which falls back to model_config.
+-- ----------------------------------------------------------------------------
+CREATE STREAM PennyEnrichedStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR PennyParamsProc USING Global.FCVAEParamsOp (
+  FeastUrl: 'http://127.0.0.1:6567',
+  ComboKeyIndex: 0,
+  EnableLogging: true
+)
+INSERT INTO PennyEnrichedStream
+FROM PennyDailyPayloadStream;
 
 -- ----------------------------------------------------------------------------
 -- Score in-process with ONNX Runtime (single Penny_All model). The OP appends
@@ -160,6 +202,8 @@ FROM PennyDailyPayloadTyped p;
 -- (signature gate rejects bad candidates and keeps the live session), and
 -- ControlFile carries the rollback command ("rollback" reverts to the prior
 -- model AND its paired threshold config).
+-- F2: Feast userdata params are used IFF complete, finite AND version-matched
+-- to the live model; otherwise the swap-paired config is the fallback.
 -- ----------------------------------------------------------------------------
 CREATE STREAM PennyScoredStream OF Global.WAEvent;
 
@@ -172,7 +216,7 @@ CREATE OPEN PROCESSOR PennyOnnxProc USING Global.FCVAEOnnxScorer (
   EnableLogging: true
 )
 INSERT INTO PennyScoredStream
-FROM PennyDailyPayloadStream;
+FROM PennyEnrichedStream;
 
 -- ----------------------------------------------------------------------------
 -- Project data[] into named fields for the formatter (formatters cannot read
@@ -201,9 +245,111 @@ CREATE TARGET PennyResultFile USING FileWriter (
 FORMAT USING JSONFormatter ()
 INPUT FROM PennyScorerResultReady;
 
-END APPLICATION PennyInference;
+-- ============================================================================
+-- ACCEL CHAIN (combo_key 'Accel_CMP'): ALL transactions with network_type
+-- 'Accel' and transaction_type 'CMP' (NO amount filter, the combo series
+-- counts every one of the combo's transactions). Mirrors the Penny chain.
+-- ============================================================================
 
-DEPLOY APPLICATION fcvaedemo.PennyInference;
-START APPLICATION fcvaedemo.PennyInference;
+CREATE CQ AccelFilter
+INSERT INTO AccelFilteredStream
+SELECT
+  'Accel_CMP'    AS combo_key,
+  txn_timestamp  AS txn_timestamp
+FROM ParsedTxnStream
+WHERE network_type = 'Accel' AND transaction_type = 'CMP';
+
+CREATE JUMPING WINDOW AccelHourlyWindow
+OVER AccelFilteredStream
+KEEP WITHIN 1 HOUR
+ON txn_timestamp
+PARTITION BY combo_key;
+
+CREATE CQ AccelHourlyCounts
+INSERT INTO AccelHourlyCountStream
+SELECT
+  w.combo_key                        AS combo_key,
+  COUNT(*)                           AS txn_count,
+  TO_STRING(FIRST(w.txn_timestamp))  AS hour_start,
+  TO_STRING(LAST(w.txn_timestamp))   AS hour_end
+FROM AccelHourlyWindow w
+GROUP BY w.combo_key;
+
+CREATE WINDOW AccelDailyWindow
+OVER AccelHourlyCountStream
+KEEP 24 ROWS
+PARTITION BY combo_key;
+
+CREATE CQ AccelAssembleDailyPayload
+INSERT INTO AccelDailyPayloadTyped
+SELECT
+  w.combo_key                              AS combo_key,
+  LIST(TO_STRING(w.txn_count))             AS values_list,
+  TO_STRING(COUNT(*))                      AS window_size,
+  TO_STRING(FIRST(w.hour_start))           AS window_start,
+  TO_STRING(LAST(w.hour_start))            AS window_end
+FROM AccelDailyWindow w
+GROUP BY w.combo_key
+HAVING COUNT(*) >= 24;
+
+CREATE STREAM AccelDailyPayloadStream OF Global.WAEvent;
+
+CREATE CQ AccelToWaevent
+INSERT INTO AccelDailyPayloadStream
+SELECT com.webaction.helpers.WAEUdf.createWAEvent(
+  'fcvaedemo.FcvaePayloadType',
+  'Accel_CMP',
+  'INSERT',
+  java.util.Arrays.asList(p.combo_key, p.values_list, p.window_size, p.window_start, p.window_end).toArray(),
+  java.util.Arrays.asList(p.combo_key, p.values_list, p.window_size, p.window_start, p.window_end).toArray()
+)
+FROM AccelDailyPayloadTyped p;
+
+CREATE STREAM AccelEnrichedStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR AccelParamsProc USING Global.FCVAEParamsOp (
+  FeastUrl: 'http://127.0.0.1:6567',
+  ComboKeyIndex: 0,
+  EnableLogging: true
+)
+INSERT INTO AccelEnrichedStream
+FROM AccelDailyPayloadStream;
+
+CREATE STREAM AccelScoredStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR AccelOnnxProc USING Global.FCVAEOnnxScorer (
+  ModelDir: '/opt/Striim/fcvae-models/Accel_CMP',
+  ControlFile: '/opt/Striim/fcvae-models/Accel_CMP/fcvae.control',
+  ValuesIndex: 1,
+  ComboKeyIndex: 0,
+  WindowEndIndex: 4,
+  EnableLogging: true
+)
+INSERT INTO AccelScoredStream
+FROM AccelEnrichedStream;
+
+CREATE CQ AccelFormatScored
+INSERT INTO AccelScorerResultReady
+SELECT
+  TO_STRING(data[0]) AS combo_key,
+  TO_STRING(data[4]) AS window_end,
+  TO_STRING(data[5]) AS is_anomaly,
+  TO_STRING(data[6]) AS anomaly_score,
+  TO_STRING(data[7]) AS threshold
+FROM AccelScoredStream;
+
+CREATE TARGET AccelResultFile USING FileWriter (
+  directory: '/opt/Striim/UploadedFiles',
+  -- disjoint from the Penny chain's fcvae_scored* glob on purpose: the
+  -- harnesses snapshot each chain by prefix
+  filename: 'fcvae_accel.json'
+)
+FORMAT USING JSONFormatter ()
+INPUT FROM AccelScorerResultReady;
+
+END APPLICATION FcvaeInference;
+
+DEPLOY APPLICATION fcvaedemo.FcvaeInference;
+START APPLICATION fcvaedemo.FcvaeInference;
 
 quit;

@@ -115,7 +115,19 @@ import java.util.concurrent.atomic.AtomicReference;
  * swap installs the (weights, scaler, threshold) PAIR atomically and a rollback
  * restores the old pair -- a new model never scores against a stale scaler or
  * threshold. The sha identity covers the model.onnx bytes ONLY: a config-only
- * edit does not trigger a swap (F2 moves the live parameters to Feast).
+ * edit does not trigger a swap.
+ *
+ * <p><b>Feast-served params (F2).</b> The upstream {@code FCVAEParamsOp} stamps
+ * per-combo scoring params from Feast into userdata ({@code fcvae_scaler_mean},
+ * {@code fcvae_scaler_scale}, {@code fcvae_last_point_threshold},
+ * {@code fcvae_model_version}). {@link #scoreEvent} scores with them IFF the
+ * three numeric params are all present and finite, scale != 0, and
+ * {@code fcvae_model_version} EXACTLY equals the live handle's version -- the
+ * version guard exists because publish updates the model files and Feast
+ * non-atomically. On any miss or skew the swap-paired {@link ModelConfig} is
+ * used instead; config remains the audit/fallback record per the architecture.
+ * Every emitted event is stamped with userdata {@code fcvae_params_used} =
+ * {@code "feast"} or {@code "config_fallback"}.
  */
 @PropertyTemplate(
     name = "FCVAEOnnxScorer",
@@ -174,6 +186,10 @@ public class FCVAEOnnxScorer extends StriimOpenProcessor {
     // Count of candidates rejected by validation (Mechanic 1). In-memory only;
     // logged on each rejection. Read on the single run() thread.
     private long rejectionCount;
+
+    // Last (feast -> live) version pair logged by the F2 skew guard, so a
+    // sustained mismatch logs once instead of per event. run()-thread only.
+    private String lastLoggedVersionMismatch;
 
     @Override
     public void start() throws Exception {
@@ -626,14 +642,37 @@ public class FCVAEOnnxScorer extends StriimOpenProcessor {
         final ModelHandle handle = sessionRef.get();
         final ModelConfig config = handle.config;
 
+        // F2: Feast-served per-combo params, stamped into userdata by the upstream
+        // FCVAEParamsOp. userdata may be absent entirely (params OP not wired, or
+        // Feast down) and values may arrive as Double or String; read defensively.
+        final Map<String, Object> ud = waevent.userdata;
+        final Double feastMean = toDouble(ud == null ? null : ud.get("fcvae_scaler_mean"));
+        final Double feastScale = toDouble(ud == null ? null : ud.get("fcvae_scaler_scale"));
+        final Double feastThreshold =
+                toDouble(ud == null ? null : ud.get("fcvae_last_point_threshold"));
+        final Object feastVersionRaw = (ud == null) ? null : ud.get("fcvae_model_version");
+        final String feastVersion =
+                (feastVersionRaw == null) ? null : String.valueOf(feastVersionRaw);
+
+        final boolean feastParamsPresent = feastMean != null && Double.isFinite(feastMean)
+                && feastScale != null && Double.isFinite(feastScale) && feastScale != 0.0
+                && feastThreshold != null && Double.isFinite(feastThreshold);
+        // Version skew guard: publish updates the model files and Feast
+        // non-atomically, so version equality pins the Feast params to the exact
+        // live weights; any skew scores on the swap-paired config instead.
+        final boolean useFeast = feastParamsPresent && handle.version.equals(feastVersion);
+        if (feastParamsPresent && !useFeast) {
+            logVersionMismatchOnce(feastVersion, handle.version);
+        }
+
         final Object[] data = waevent.data;
         final String comboKey = stringAt(data, comboKeyIndex, "Penny_All");
         final String windowEnd = stringAt(data, windowEndIndex, "");
         final float[] rawValues = parseValues(stringAt(data, valuesIndex, ""));
 
         // StandardScaler: (x - mean) / scale.
-        final float mean = config.scaler.mean.floatValue();
-        final float scale = config.scaler.scale.floatValue();
+        final float mean = useFeast ? feastMean.floatValue() : config.scaler.mean.floatValue();
+        final float scale = useFeast ? feastScale.floatValue() : config.scaler.scale.floatValue();
         final float[][][] inputArray = new float[1][1][rawValues.length];
         for (int i = 0; i < rawValues.length; i++) {
             inputArray[0][0][i] = (rawValues[i] - mean) / scale;
@@ -647,7 +686,8 @@ public class FCVAEOnnxScorer extends StriimOpenProcessor {
             lastPointScore = nll[0][nll[0].length - 1];   // last point = scored hour
         }
 
-        final double threshold = config.thresholds.last_point_threshold;
+        final double threshold = useFeast ? feastThreshold.doubleValue()
+                : config.thresholds.last_point_threshold;
         final boolean isAnomaly = lastPointScore < threshold;
 
         if (enableLogging) {
@@ -657,7 +697,10 @@ public class FCVAEOnnxScorer extends StriimOpenProcessor {
         appendResult(waevent, isAnomaly, lastPointScore, threshold);
 
         // Stamp the live model identity onto userdata for downstream observability
-        // (Mechanic 3): which (model, config) pair produced this score.
+        // (Mechanic 3): which (model, config) pair produced this score. appendResult
+        // above has already created userdata when it was null, so the F2 params-used
+        // stamp always lands on every emitted event.
+        waevent.userdata.put("fcvae_params_used", useFeast ? "feast" : "config_fallback");
         waevent.userdata.put("model_path", handle.path);
         waevent.userdata.put("model_sha256", handle.sha256);
         waevent.userdata.put("model_version", handle.version);
@@ -728,6 +771,24 @@ public class FCVAEOnnxScorer extends StriimOpenProcessor {
         }
     }
 
+    /**
+     * Coerces a userdata value (Number or numeric String) to a Double; null or
+     * unparseable yields null, never a throw. ModelOp's toFloat, widened.
+     */
+    private static Double toDouble(final Object v) {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof Number) {
+            return ((Number) v).doubleValue();
+        }
+        try {
+            return Double.parseDouble(String.valueOf(v).trim());
+        } catch (final NumberFormatException e) {
+            return null;
+        }
+    }
+
     @Override
     public void close() throws Exception {
         super.close();
@@ -794,6 +855,20 @@ public class FCVAEOnnxScorer extends StriimOpenProcessor {
         if (enableLogging) {
             System.out.println("FCVAEOnnxScorer: " + message);
         }
+    }
+
+    /**
+     * Logs the F2 fallback on a Feast/live version mismatch ONCE per distinct
+     * (feast, live) version pair, EnableLogging-gated -- not a per-event logError.
+     */
+    private void logVersionMismatchOnce(final String feastVersion, final String liveVersion) {
+        final String pair = feastVersion + " -> " + liveVersion;
+        if (pair.equals(lastLoggedVersionMismatch)) {
+            return;
+        }
+        lastLoggedVersionMismatch = pair;
+        log("Feast params version " + feastVersion + " != live model version " + liveVersion
+                + "; falling back to swap-paired config");
     }
 
     private void logError(final String message) {

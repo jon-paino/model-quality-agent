@@ -23,8 +23,13 @@ JSONFormatter files are OPEN arrays until rollover, so records are parsed one
 at a time with a tolerant raw_decode loop across ALL matching rolled files.
 
 Subcommands:
-  snapshot  capture {hour_offset: {score, threshold, is_anomaly}} for a phase.
-  compare   diff two snapshots, asserting --expect identical|different.
+  snapshot     capture {hour_offset: {score, threshold, is_anomaly}} for a
+               phase (optionally filtered to one --combo-key).
+  compare      diff two snapshots, asserting --expect identical|different
+               (--scores-only relaxes `identical` to score equality alone,
+               ignoring thresholds: the F2 Feast-flip proof).
+  assert-snap  assert properties of ONE snapshot: a uniform threshold value
+               (within 1e-6) and/or the anomaly rate (within 1e-9).
 """
 import datetime as dt
 import glob
@@ -84,10 +89,12 @@ def parse_bool(s):
     return str(s).strip().lower() in ("true", "1", "yes", "t")
 
 
-def collect(pred_dir, prefix, phase_start, phase_end):
+def collect(pred_dir, prefix, phase_start, phase_end, combo_key=None):
     """One phase's scores keyed by hour offset; latest record wins per key."""
     snap = {}
     for r in all_records(pred_dir, prefix):
+        if combo_key is not None and str(r.get("combo_key", "")).strip() != combo_key:
+            continue
         we = parse_window_end(r.get("window_end"))
         if we is None or not (phase_start <= we < phase_end):
             continue
@@ -130,11 +137,14 @@ def cli():
               show_default=True, help="Directory holding the scored JSON files.")
 @click.option("--prefix", default="fcvae_scored", show_default=True,
               help="Scored file prefix (all <prefix>*.json files are scanned).")
+@click.option("--combo-key", "combo_key", default=None,
+              help="Only records with this combo_key (default: no filter).")
 @click.option("--min-count", "min_count", default=1, show_default=True, type=int,
               help="Minimum number of keys required for the snapshot to succeed.")
 @click.option("--wait-sec", "wait_sec", default=0, show_default=True, type=int,
               help="Poll every 5s until min-count keys appear; 0 = single attempt.")
-def snapshot(out, base_start, shift_days, days, pred_dir, prefix, min_count, wait_sec):
+def snapshot(out, base_start, shift_days, days, pred_dir, prefix, combo_key,
+             min_count, wait_sec):
     """Capture one phase's scores, keyed by hour offset from the phase start."""
     try:
         base = dt.datetime.strptime(base_start, "%Y-%m-%d")
@@ -145,7 +155,7 @@ def snapshot(out, base_start, shift_days, days, pred_dir, prefix, min_count, wai
 
     deadline = time.time() + wait_sec
     while True:
-        snap = collect(pred_dir, prefix, phase_start, phase_end)
+        snap = collect(pred_dir, prefix, phase_start, phase_end, combo_key)
         if len(snap) >= min_count:
             break
         if time.time() >= deadline:
@@ -168,9 +178,13 @@ def snapshot(out, base_start, shift_days, days, pred_dir, prefix, min_count, wai
 @click.argument("b", type=click.Path(exists=True, dir_okay=False))
 @click.option("--expect", type=click.Choice(["identical", "different"]),
               help="Assertion; omitted = informational (exit 0 unless too few common keys).")
+@click.option("--scores-only", "scores_only", is_flag=True, default=False,
+              help="`identical` compares SCORES only, ignoring threshold equality "
+                   "(F2: a Feast-only param flip keeps scores bit-identical while "
+                   "the threshold moves).")
 @click.option("--min-common", "min_common", default=50, show_default=True, type=int,
               help="Minimum common keys required for a meaningful comparison.")
-def compare(a, b, expect, min_common):
+def compare(a, b, expect, scores_only, min_common):
     """Diff two snapshots; scores must match BITWISE for `identical`."""
     with open(a) as f:
         snap_a = json.load(f)
@@ -190,16 +204,79 @@ def compare(a, b, expect, min_common):
     thr_b = thr_summary(snap_b, common)
 
     if expect == "identical":
-        ok = all(snap_a[k]["score"] == snap_b[k]["score"]
-                 and snap_a[k]["threshold"] == snap_b[k]["threshold"] for k in common)
+        ok = all(snap_a[k]["score"] == snap_b[k]["score"] for k in common)
+        if not scores_only:
+            ok = ok and all(snap_a[k]["threshold"] == snap_b[k]["threshold"]
+                            for k in common)
     elif expect == "different":
         # A real swap moves essentially every score; require a strict majority.
         ok = changed * 2 > len(common)
     else:
         ok = True
 
+    mode = f"{expect or 'none'}{'(scores-only)' if scores_only else ''}"
     click.echo(f"COMPARE common={len(common)} changed={changed} max_abs_diff={max_abs:.6g} "
-               f"thresholdA={thr_a} thresholdB={thr_b} expect={expect or 'none'} "
+               f"thresholdA={thr_a} thresholdB={thr_b} expect={mode} "
+               f"verdict={'PASS' if ok else 'FAIL'}")
+    sys.exit(0 if ok else 1)
+
+
+# Tolerances: threshold uniformity/equality within 1e-6 (matches the F1
+# harness's threshold_matches); anomaly rate within 1e-9 (exact for the 0/1
+# rates the F2 phases assert).
+THRESHOLD_TOL = 1e-6
+RATE_TOL = 1e-9
+
+
+@cli.command("assert-snap")
+@click.argument("snapfile", type=click.Path(exists=True, dir_okay=False))
+@click.option("--expect-threshold", "expect_threshold", type=float, default=None,
+              help="Require a UNIFORM threshold across all entries, equal to this "
+                   f"value (both within {THRESHOLD_TOL:g}).")
+@click.option("--expect-anomaly-rate", "expect_rate", type=float, default=None,
+              help="Require the fraction of entries with is_anomaly true to equal "
+                   f"this value (within {RATE_TOL:g}).")
+@click.option("--tolerance", type=float, default=0.0, show_default=True,
+              help="Allowed fraction of deviating entries. 0 keeps the strict "
+                   "behavior (uniform threshold, exact rate); > 0 accepts the "
+                   "designed per-event fallback under transient Feast hiccups: "
+                   "the threshold must match on >= 1-tolerance of entries and "
+                   "the anomaly rate must be within tolerance of expected.")
+def assert_snap(snapfile, expect_threshold, expect_rate, tolerance):
+    """Assert threshold and/or anomaly-rate properties of ONE snapshot."""
+    with open(snapfile) as f:
+        snap = json.load(f)
+    if not snap:
+        click.echo(f"ASSERT keys=0 verdict=FAIL (empty snapshot {snapfile})")
+        sys.exit(1)
+
+    keys = sorted(snap, key=int)
+    thrs = [snap[k]["threshold"] for k in keys]
+    rate = sum(1 for k in keys if snap[k]["is_anomaly"]) / len(keys)
+
+    ok = True
+    checks = []
+    if expect_threshold is not None:
+        frac = sum(1 for t in thrs if abs(t - expect_threshold) < THRESHOLD_TOL) / len(thrs)
+        if tolerance > 0:
+            thr_ok = frac >= 1.0 - tolerance
+            checks.append(f"expect_threshold={expect_threshold:g}"
+                          f"@frac={frac:.3f}({'OK' if thr_ok else 'BAD'})")
+        else:
+            uniform = (max(thrs) - min(thrs)) < THRESHOLD_TOL
+            thr_ok = uniform and frac == 1.0
+            checks.append(f"expect_threshold={expect_threshold:g}"
+                          f"({'OK' if thr_ok else 'BAD'})")
+        ok = ok and thr_ok
+    if expect_rate is not None:
+        rate_tol = tolerance if tolerance > 0 else RATE_TOL
+        rate_ok = abs(rate - expect_rate) <= rate_tol
+        ok = ok and rate_ok
+        checks.append(f"expect_anomaly_rate={expect_rate:g}"
+                      f"({'OK' if rate_ok else 'BAD'})")
+
+    click.echo(f"ASSERT keys={len(keys)} threshold={thr_summary(snap, keys)} "
+               f"anomaly_rate={rate:.6g} {' '.join(checks) or 'no-assertions'} "
                f"verdict={'PASS' if ok else 'FAIL'}")
     sys.exit(0 if ok else 1)
 

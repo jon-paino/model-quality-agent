@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # deploy_fcvae.sh -- tear down any previous FCVAE apps, rebuild + stage + load the
-# FCVAEOnnxScorer module, deploy the F1 pipeline (fcvae_inference.tql), and wait
-# for the app to reach RUNNING.
+# FCVAEOnnxScorer AND FCVAEParamsOp modules, deploy the F2 pipeline
+# (fcvae_inference.tql, app fcvaedemo.FcvaeInference), and wait for the app to
+# reach RUNNING.
 #
 # Transport (see CLAUDE.md "Tungsten Console + REST API"):
 #   - REST tungsten endpoint for teardown / LOAD / status polling. Teardown
@@ -25,9 +26,11 @@ STRIIM_HOME="${STRIIM_HOME:-/opt/Striim}"
 BASE_URL="${STRIIM_BASE_URL:-http://localhost:9080}"
 CLUSTER="${STRIIM_CLUSTER:-JonPaino}"
 TQL_FILE="${SCRIPT_DIR}/fcvae_inference.tql"
-BUILD_SH="${SCRIPT_DIR}/../fcvae-scorer/build.sh"
-APP="fcvaedemo.PennyInference"
-SCM="UploadedFiles/FCVAEOnnxScorer.scm"
+BUILD_SCORER="${SCRIPT_DIR}/../fcvae-scorer/build.sh"
+BUILD_PARAMS="${SCRIPT_DIR}/../fcvae-params-op/build.sh"
+APP="fcvaedemo.FcvaeInference"
+SCM_SCORER="UploadedFiles/FCVAEOnnxScorer.scm"
+SCM_PARAMS="UploadedFiles/FCVAEParamsOp.scm"
 
 if [ -z "${STRIIM_ADMIN_PW:-}" ]; then
   echo "ERROR: STRIIM_ADMIN_PW must be set (Striim admin password for REST + console.sh)" >&2
@@ -89,24 +92,37 @@ echo "== teardown (tolerant: absent objects are fine) =="
 tolerant "STOP APPLICATION ${APP};"
 tolerant "UNDEPLOY APPLICATION ${APP};"
 tolerant "DROP APPLICATION ${APP} CASCADE;"
+# stale F1 app name (pre-F2 rename) may still be deployed
+tolerant "STOP APPLICATION fcvaedemo.PennyInference;"
+tolerant "UNDEPLOY APPLICATION fcvaedemo.PennyInference;"
+tolerant "DROP APPLICATION fcvaedemo.PennyInference CASCADE;"
 # DROP NAMESPACE only works from ANOTHER namespace, so 'use admin;' rides in the
 # SAME post (REST posts do not share console session state across calls).
 tolerant "use admin; DROP NAMESPACE fcvaedemo CASCADE;"
 # stale sibling-repo (fcvae-anomaly-detection) leftovers
 tolerant "use admin; DROP NAMESPACE fcvae CASCADE;"
 tolerant "use admin; DROP NAMESPACE fcvae_onnx CASCADE;"
-tolerant "UNLOAD OPEN PROCESSOR '${SCM}';"
+tolerant "UNLOAD OPEN PROCESSOR '${SCM_SCORER}';"
+tolerant "UNLOAD OPEN PROCESSOR '${SCM_PARAMS}';"
 
 echo
-echo "== rebuild + stage the module (striim/fcvae-scorer/build.sh) =="
-if ! STRIIM_HOME="${STRIIM_HOME}" "${BUILD_SH}"; then
-  echo "ERROR: build.sh failed; module not staged" >&2
+echo "== rebuild + stage the scorer module (striim/fcvae-scorer/build.sh) =="
+if ! STRIIM_HOME="${STRIIM_HOME}" "${BUILD_SCORER}"; then
+  echo "ERROR: fcvae-scorer/build.sh failed; module not staged" >&2
   exit 5
 fi
 
 echo
-echo "== load the module =="
-require "LOAD OPEN PROCESSOR '${SCM}';"
+echo "== rebuild + stage the params module (striim/fcvae-params-op/build.sh) =="
+if ! STRIIM_HOME="${STRIIM_HOME}" "${BUILD_PARAMS}"; then
+  echo "ERROR: fcvae-params-op/build.sh failed; module not staged" >&2
+  exit 5
+fi
+
+echo
+echo "== load the modules =="
+require "LOAD OPEN PROCESSOR '${SCM_SCORER}';"
+require "LOAD OPEN PROCESSOR '${SCM_PARAMS}';"
 
 echo
 echo "== list open processors (ADVISORY: on 5.2.0.4 this lists deployed OP"
@@ -116,6 +132,9 @@ LIST_RESP="$(tungsten 'LIST OPENPROCESSORS;')"
 echo "   ${LIST_RESP}"
 if ! printf '%s' "${LIST_RESP}" | grep -q 'FCVAEOnnxScorer'; then
   echo "   note: FCVAEOnnxScorer not listed (expected before its app deploys)"
+fi
+if ! printf '%s' "${LIST_RESP}" | grep -q 'FCVAEParamsOp'; then
+  echo "   note: FCVAEParamsOp not listed (expected before its app deploys)"
 fi
 
 echo
