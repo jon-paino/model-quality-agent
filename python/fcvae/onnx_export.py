@@ -17,6 +17,7 @@ import json
 import pickle
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,7 @@ from .compat import install_pickle_shims
 from .config import (ARTIFACTS, COMBO_MODELS, DATA_CSV, GOLDEN_NAME, MODEL_CONFIG_NAME,
                      MODEL_NAMES, ONNX_INPUT_NAME, ONNX_OPSET, ONNX_OUTPUT_NAME, PENNY_MODEL,
                      SEED, WINDOW_SIZE)
+from .metrics import point_adjusted_f1
 
 if TYPE_CHECKING:
     from .model import FCVAE
@@ -45,6 +47,10 @@ except ModuleNotFoundError:
 MAX_ABS_TOL = 1.0
 MEAN_ABS_TOL = 1e-2
 AGREEMENT_MIN = 0.999
+
+# Candidate-quality evaluation written at export time; publish only records it
+# (so publish stays torch-free and data-free).
+METRICS_NAME = "metrics.json"
 
 
 class FCVAEInferenceWrapper(nn.Module):
@@ -209,15 +215,15 @@ def load_threshold(model_dir: Path) -> float:
     return float(threshold)
 
 
-def build_golden_set(model_name: str, model_dir: Path, data_csv: Path,
-                     n_golden: int, seed: int):
-    """TEST-split windows for the golden set, normalized with the model's scaler.
+def _load_test_split(model_name: str, model_dir: Path, data_csv: Path):
+    """FULL test split for a model, normalized with the model's scaler.
 
-    Unlike the source's load_test_windows there is NO silent random fallback:
-    a missing CSV, missing scaler, or empty test split is a hard error.
+    Extracted from build_golden_set so cmd_export can evaluate candidate
+    quality over the whole split while the golden subsample is derived from
+    the very same arrays. No silent random fallback: a missing CSV, missing
+    scaler, or empty test split is a hard error.
 
-    Returns (indices, raw_windows, normalized_windows, labels); indices are
-    positions in the test-split window array.
+    Returns (hourly_df, test_windows, normalized_windows, test_labels).
     """
     install_pickle_shims()
     from .preprocess import (create_sliding_windows, create_splits, load_combo_data,
@@ -248,12 +254,33 @@ def build_golden_set(model_name: str, model_dir: Path, data_csv: Path,
 
     flat = test_windows.flatten().reshape(-1, 1)
     normalized = scaler.transform(flat).reshape(test_windows.shape)
+    return hourly_df, test_windows, normalized, test_labels
 
+
+def _golden_subsample(test_windows: np.ndarray, normalized: np.ndarray,
+                      test_labels: np.ndarray, n_golden: int, seed: int):
+    """Deterministic golden subsample of the full test split. Same RNG stream
+    and selection as the original build_golden_set, so a re-export reproduces
+    the frozen golden JSONL byte-for-byte given the same checkpoint."""
     if len(normalized) > n_golden:
         indices = np.random.default_rng(seed).choice(len(normalized), n_golden, replace=False)
     else:
         indices = np.arange(len(normalized))
     return indices, test_windows[indices], normalized[indices], test_labels[indices]
+
+
+def build_golden_set(model_name: str, model_dir: Path, data_csv: Path,
+                     n_golden: int, seed: int):
+    """TEST-split windows for the golden set, normalized with the model's scaler.
+
+    Unlike the source's load_test_windows there is NO silent random fallback:
+    a missing CSV, missing scaler, or empty test split is a hard error.
+
+    Returns (indices, raw_windows, normalized_windows, labels); indices are
+    positions in the test-split window array.
+    """
+    _, test_windows, normalized, test_labels = _load_test_split(model_name, model_dir, data_csv)
+    return _golden_subsample(test_windows, normalized, test_labels, n_golden, seed)
 
 
 def freeze_expectations(model, normalized: np.ndarray) -> np.ndarray:
@@ -345,7 +372,8 @@ def load_golden(path: Path) -> list[dict]:
 
 def run_parity(onnx_path: Path, records: list[dict], max_abs_tol: float = MAX_ABS_TOL,
                mean_abs_tol: float = MEAN_ABS_TOL,
-               agreement_min: float = AGREEMENT_MIN) -> tuple[dict, bool]:
+               agreement_min: float = AGREEMENT_MIN,
+               gates_label: str = "PROVISIONAL F0 gates (source repo)") -> tuple[dict, bool]:
     """ONNX Runtime vs the frozen golden expectations. Torch-free (json/numpy/
     onnxruntime only) so the F1 publish gate can rerun it without the training
     stack. Returns (metrics, gates_passed)."""
@@ -387,7 +415,7 @@ def run_parity(onnx_path: Path, records: list[dict], max_abs_tol: float = MAX_AB
     if metrics["mean_abs_diff"] > mean_abs_tol:
         failures.append(f"mean_abs {metrics['mean_abs_diff']:.3e} > {mean_abs_tol}")
 
-    gates = (f"PROVISIONAL F0 gates (source repo): agreement >= {agreement_min}, "
+    gates = (f"{gates_label}: agreement >= {agreement_min}, "
              f"max_abs <= {max_abs_tol}, mean_abs <= {mean_abs_tol}")
     if failures:
         click.echo(f"FAIL {gates}")
@@ -396,6 +424,60 @@ def run_parity(onnx_path: Path, records: list[dict], max_abs_tol: float = MAX_AB
     else:
         click.echo(f"PASS {gates}")
     return metrics, not failures
+
+
+def evaluate_candidate(onnx_path: Path, normalized_test: np.ndarray, test_labels: np.ndarray,
+                       threshold: float, hourly_df, data_csv: Path,
+                       batch_size: int = 256) -> dict:
+    """Candidate-quality evaluation over the FULL test split, scored through
+    onnxruntime (CPU EP, batched). Runs at export time and lands in
+    metrics.json, so publish stays torch-free and data-free: it only records
+    this object into the manifest.
+
+    Decision series: preds = nll[:, -1] < threshold vs ground truth
+    test_labels[:, -1]. The test windows are stride-1 and time-ordered, so the
+    last-point series IS the hourly series and point_adjusted_f1 over it is
+    the DONUT/FCVAE-paper segment metric on the test hours.
+
+    Returns the metrics.json "eval" object.
+    """
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    x = np.asarray(normalized_test, dtype=np.float32)[:, np.newaxis, :]
+    chunks = [sess.run([ONNX_OUTPUT_NAME], {ONNX_INPUT_NAME: x[i:i + batch_size]})[0]
+              for i in range(0, len(x), batch_size)]
+    nll = np.concatenate(chunks, axis=0).astype(np.float64)
+
+    preds = nll[:, -1] < threshold
+    gt = np.asarray(test_labels)[:, -1].astype(bool)
+    tp = int(np.sum(preds & gt))
+    fp = int(np.sum(preds & ~gt))
+    fn = int(np.sum(~preds & gt))
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    if "split" in hourly_df.columns:
+        test_hours = hourly_df.loc[hourly_df["split"] == "test", "hour_bucket"]
+    else:
+        # Day-based fallback boundary, mirroring preprocess.create_splits
+        # (test starts at hour 50 * 24 when the CSV has no split column).
+        test_hours = hourly_df["hour_bucket"].iloc[50 * 24:]
+
+    return {
+        "split": "test",
+        "n_windows": int(len(x)),
+        "n_anomalous_last_points": int(gt.sum()),
+        "threshold": float(threshold),
+        "raw_last_point": {"precision": precision, "recall": recall, "f1": f1,
+                           "tp": tp, "fp": fp, "fn": fn},
+        "point_adjusted_last_point": point_adjusted_f1(preds, gt),
+        "scored_with": "onnxruntime",
+        "data_csv": str(data_csv),
+        "data_span": {"start": test_hours.min().isoformat(),
+                      "end": test_hours.max().isoformat()},
+    }
 
 
 @click.group()
@@ -433,8 +515,10 @@ def cmd_export(model_name: str, model_dir: Path, out_dir: Path, data_csv: Path,
     export_companion_json(model_dir, model_name, cfg, out_dir)
 
     threshold = load_threshold(model_dir)
-    indices, raw, normalized, labels = build_golden_set(
-        model_name, model_dir, data_csv, n_golden, seed)
+    hourly_df, test_windows, normalized_full, test_labels = _load_test_split(
+        model_name, model_dir, data_csv)
+    indices, raw, normalized, labels = _golden_subsample(
+        test_windows, normalized_full, test_labels, n_golden, seed)
     expected = freeze_expectations(model, normalized)
     golden_path = out_dir / GOLDEN_NAME
     write_golden_set(golden_path, model_name, indices, raw, normalized, expected,
@@ -443,6 +527,25 @@ def cmd_export(model_name: str, model_dir: Path, out_dir: Path, data_csv: Path,
     _, ok = run_parity(onnx_path, load_golden(golden_path))
     if not ok:
         sys.exit(1)
+
+    eval_obj = evaluate_candidate(onnx_path, normalized_full, test_labels, threshold,
+                                  hourly_df, data_csv)
+    metrics = {
+        "model_name": model_name,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "eval": eval_obj,
+    }
+    metrics_path = out_dir / METRICS_NAME
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+        f.write("\n")
+    click.echo(f"[write] {metrics_path}")
+    click.echo(
+        f"EVAL model={model_name} n={eval_obj['n_windows']} "
+        f"raw_f1={eval_obj['raw_last_point']['f1']:.4f} "
+        f"pa_f1={eval_obj['point_adjusted_last_point']['f1']:.4f} "
+        f"threshold={eval_obj['threshold']}"
+    )
 
 
 @cli.command("check")

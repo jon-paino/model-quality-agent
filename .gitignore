@@ -13,6 +13,10 @@ target/
 # Regenerable ONNX swap-test artifacts (emitted by make_swap_artifacts.py)
 striim/model-op/test/artifacts/
 
+# Regenerable FCVAE swap-test artifacts (make_bad_models.py) and feed slices (make_fcvae_feed.py)
+striim/fcvae-scorer/test/artifacts/
+striim/pipeline/feeds/
+
 # Compiled JVM load-test classes (run_load_test.sh rebuilds them)
 striim/fcvae-scorer/test/classes/
 

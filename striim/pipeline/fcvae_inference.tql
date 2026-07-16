@@ -1,10 +1,15 @@
 -- Vendored from fcvae-anomaly-detection striim/FCVAE_ONNX.tql
--- (branch onnx-hybrid-passthrough, commit 9575ba5). F1 will rewire this
--- (hot-swap scorer; namespace decisions pending). Requires the WAEUdf SE
--- add-on jar in $STRIIM_HOME/lib. Do NOT deploy as-is.
+-- (branch onnx-hybrid-passthrough, commit 9575ba5), REWIRED FOR F1:
+-- namespace fcvaedemo / app PennyInference, hot-swap scorer (ControlFile),
+-- feed dir /tmp/fcvae_swap_test, scored JSON in /opt/Striim/UploadedFiles.
+-- Requires the WAEUdf SE add-on jar in $STRIIM_HOME/lib.
+--
+-- Deployed by striim/pipeline/deploy_fcvae.sh via console.sh -f (absolute
+-- path), hence the trailing quit;. The deploy script pre-drops the fcvaedemo
+-- namespace, so this file may assume the namespace does NOT exist.
 
 -- ============================================================================
--- FCVAE PENNY (ONNX): in-process penny-carding anomaly detection
+-- FCVAE PENNY (ONNX): in-process penny-carding anomaly detection (F1 wiring)
 --
 -- Penny-carding use case: a single pooled FCVAE model ("Penny_All") scores the
 -- hourly frequency of penny transactions (amount < $1), running INSIDE the
@@ -16,26 +21,28 @@
 -- Open Processor wired DIRECTLY in TQL. No types JAR, no JAR-removal trick, no
 -- Flow Designer. One CREATE TYPE (for the createWAEvent payload) is required.
 --
--- Fully isolated: namespace fcvae_onnx, application FCVAEOnnxPenny, its own
--- /tmp/fcvae_onnx_penny_test I/O dir. Does not touch the production `fcvae` app.
+-- F1 additions over the vendored form:
+--   - hot-swap scorer: the OP watches ModelDir/model.onnx (mtime gate, sha
+--     compare, signature gate) and ControlFile for rollback commands, so a
+--     republished model deploys with zero pipeline downtime;
+--   - the feed dir is /tmp/fcvae_swap_test (the F1 acceptance harness feeds
+--     penny_feed_s<shift>.csv files there);
+--   - scored output lands in /opt/Striim/UploadedFiles/fcvae_scored*.json so
+--     the harness can snapshot/compare predictions.
 --
--- PREREQUISITES (run in the Striim console BEFORE deploying):
---   1. Install the WAEUdf library JAR into $STRIIM_HOME/lib/ and restart Striim.
+-- PREREQUISITES (the deploy script handles 2 and 3):
+--   1. WAEUdf library JAR in $STRIIM_HOME/lib/ and Striim restarted.
 --        (SE add-on; see https://webaction.atlassian.net/wiki/spaces/SE/pages/2318336001 )
 --        Confirm: the class com.webaction.helpers.WAEUdf is on the classpath.
---   2. Build + stage the OP:  striim/fcvae-onnx-scorer/build.sh
+--   2. Build + stage the OP:  striim/fcvae-scorer/build.sh
 --   3. Load it:               LOAD OPEN PROCESSOR 'UploadedFiles/FCVAEOnnxScorer.scm';
 --   4. Penny model bundle in  /opt/Striim/fcvae-models/Penny_All/
---        (model.onnx + model.onnx.data + model_config.json)
---   5. Penny transactions CSV in /tmp/fcvae_onnx_penny_test/
---
--- DEPLOY:
---   DEPLOY APPLICATION fcvae_onnx.FCVAEOnnxPenny;
---   START  APPLICATION fcvae_onnx.FCVAEOnnxPenny;
+--        (model.onnx + model_config.json, published by python -m fcvae.publish)
+--   5. Penny transactions CSV in /tmp/fcvae_swap_test/
 -- ============================================================================
 
-CREATE NAMESPACE fcvae_onnx;
-USE fcvae_onnx;
+CREATE NAMESPACE fcvaedemo;
+USE fcvaedemo;
 
 -- Striim type for the createWAEvent payload (5 fields -> data[0..4]). All String
 -- so the data[] array is uniform; the OP reads each value as a string.
@@ -47,15 +54,15 @@ CREATE TYPE PennyPayloadType (
   window_end   String
 );
 
-CREATE APPLICATION FCVAEOnnxPenny;
+CREATE APPLICATION PennyInference;
 
 -- ----------------------------------------------------------------------------
 -- Ingest raw transaction rows from CSV (own input dir for isolation).
 -- Columns: timestamp,network_type,transaction_type,amount,is_anomaly,penny_is_anomaly,split
 -- ----------------------------------------------------------------------------
 CREATE SOURCE PennyTxnFileSource USING FileReader (
-  directory: '/tmp/fcvae_onnx_penny_test',
-  wildcard: 'synthetic_transactions*.csv',
+  directory: '/tmp/fcvae_swap_test',
+  wildcard: 'penny_feed*.csv',
   positionByEOF: false
 )
 PARSE USING DSVParser (
@@ -137,7 +144,7 @@ CREATE STREAM PennyDailyPayloadStream OF Global.WAEvent;
 CREATE CQ PennyToWaevent
 INSERT INTO PennyDailyPayloadStream
 SELECT com.webaction.helpers.WAEUdf.createWAEvent(
-  'fcvae_onnx.PennyPayloadType',
+  'fcvaedemo.PennyPayloadType',
   'Penny_All',
   'INSERT',
   java.util.Arrays.asList(p.combo_key, p.values_list, p.window_size, p.window_start, p.window_end).toArray(),
@@ -148,11 +155,17 @@ FROM PennyDailyPayloadTyped p;
 -- ----------------------------------------------------------------------------
 -- Score in-process with ONNX Runtime (single Penny_All model). The OP appends
 -- results to data[]:  data[5]=is_anomaly  data[6]=anomaly_score  data[7]=threshold
+--
+-- F1 hot-swap: the OP re-examines ModelDir/model.onnx when its mtime advances
+-- (signature gate rejects bad candidates and keeps the live session), and
+-- ControlFile carries the rollback command ("rollback" reverts to the prior
+-- model AND its paired threshold config).
 -- ----------------------------------------------------------------------------
 CREATE STREAM PennyScoredStream OF Global.WAEvent;
 
 CREATE OPEN PROCESSOR PennyOnnxProc USING Global.FCVAEOnnxScorer (
   ModelDir: '/opt/Striim/fcvae-models/Penny_All',
+  ControlFile: '/opt/Striim/fcvae-models/Penny_All/fcvae.control',
   ValuesIndex: 1,
   ComboKeyIndex: 0,
   WindowEndIndex: 4,
@@ -176,13 +189,21 @@ SELECT
 FROM PennyScoredStream;
 
 -- ----------------------------------------------------------------------------
--- Write scored results to JSON (own output dir for isolation)
+-- Write scored results to JSON (UploadedFiles so the acceptance harness can
+-- snapshot fcvae_scored*.json)
 -- ----------------------------------------------------------------------------
 CREATE TARGET PennyResultFile USING FileWriter (
-  directory: '/tmp/fcvae_onnx_penny_test',
-  filename: 'penny_scored_output'
+  directory: '/opt/Striim/UploadedFiles',
+  -- .json must be part of the filename property (taxi convention): FileWriter
+  -- names rolled files <stem>.NN.json and every consumer globs fcvae_scored*.json
+  filename: 'fcvae_scored.json'
 )
 FORMAT USING JSONFormatter ()
 INPUT FROM PennyScorerResultReady;
 
-END APPLICATION FCVAEOnnxPenny;
+END APPLICATION PennyInference;
+
+DEPLOY APPLICATION fcvaedemo.PennyInference;
+START APPLICATION fcvaedemo.PennyInference;
+
+quit;
