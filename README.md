@@ -77,9 +77,6 @@ striim/                 Striim Open Processors (Java, WAEvent pass-through) + Ma
   mysql/                MySQL 8.0 CDC setup for the schema-evolution signal
 python/                 uv project: taxi `model` package + vendored `fcvae` package,
                         trainer Dockerfiles (Dockerfile taxi, Dockerfile.fcvae)
-reference-OPs/          field-team sample OPs (ground truth for OP patterns)
-CLAUDE.md               Striim OP development guide + every hard-won platform gotcha (local-only)
-docs/                   plans, briefs, backlog (local-only by design)
 ```
 
 ## Build and run
