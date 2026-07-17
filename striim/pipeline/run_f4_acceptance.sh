@@ -293,8 +293,11 @@ feed_shift() {
 }
 
 snap_penny() {
+  # 600s, not the F1-F3 harnesses' 300s: this harness runs monitor ticks, the
+  # trigger, feast, and docker alongside scoring, and a back-to-back suite
+  # sweep showed a post-fire burst legitimately taking > 300s to score.
   py "${CHECK_SWAP}" snapshot --base-start "${TEST_START}" --shift-days "$1" \
-      --min-count "${EXPECT_KEYS_PENNY}" --wait-sec 300 --out "$2"
+      --min-count "${EXPECT_KEYS_PENNY}" --wait-sec 600 --out "$2"
 }
 
 drop_labels() {
