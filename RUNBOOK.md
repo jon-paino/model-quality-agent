@@ -14,10 +14,14 @@ Conventions used throughout:
 - **Console** = the Tungsten console in the Striim web UI (`http://localhost:9080`,
   log in as `admin`). Statements are pasted there unless a command block starts
   with `$` (then it is a shell command).
-- The pipeline reads/writes two **fixed data directories**: `/opt/Striim/fcvae-models`
-  (model bundles) and `/opt/Striim/UploadedFiles` (scored output). These are plain
-  data paths baked into the TQL — they work identically whether or not your Striim
-  is actually installed at `/opt/Striim` (Phase 0 creates them).
+- The pipeline reads/writes two **data directories of your choice**, referred to
+  as `$FCVAE_MODELS` (model bundles the scorer watches) and `$FCVAE_OUT` (scored
+  output + eval files). Phase 0 sets them; the defaults are
+  `/opt/Striim/fcvae-models` and `/opt/Striim/UploadedFiles`, which are plain
+  data paths unrelated to where Striim is installed. Every shell command below
+  uses the variables, so they work with any choice; only the pasted TQL carries
+  the defaults as literals, and Phase 0 shows the one find/replace that
+  relocates them.
 
 ---
 
@@ -31,18 +35,38 @@ Conventions used throughout:
 | Docker (Phase 8 only) | `docker info` |
 | The fixed data directories | see below |
 
+Pick the two data directories (set these in every terminal you use; put them
+in your shell profile for the duration of the demo):
+
 ```bash
-$ sudo mkdir -p /opt/Striim/fcvae-models /opt/Striim/UploadedFiles
-$ sudo chown "$(whoami)" /opt/Striim/fcvae-models /opt/Striim/UploadedFiles
+$ export FCVAE_MODELS=/opt/Striim/fcvae-models    # or ANY directory you prefer
+$ export FCVAE_OUT=/opt/Striim/UploadedFiles      # or ANY directory you prefer
+$ sudo mkdir -p "$FCVAE_MODELS" "$FCVAE_OUT" && sudo chown "$(whoami)" "$FCVAE_MODELS" "$FCVAE_OUT"
 $ mkdir -p /tmp/fcvae_swap_test          # the feed directory the pipeline watches
 ```
 
 Both directories must be writable by **whoever runs the Striim server** too
-(the pipeline's FileWriters create the scored JSON in `UploadedFiles`). On a
+(the pipeline's FileWriters create the scored JSON in `$FCVAE_OUT`). On a
 Mac dev box where you start Striim yourself, the chown above is enough; if
 Striim runs as a service user (packaged Linux installs), chown to that user
 instead, or `chmod 775` with a shared group (`777` is fine for a throwaway
 demo box).
+
+**If you changed either default**: TQL has no variables, so make local copies
+of the two app files with the literals rewritten (one command, then use the
+copies wherever a later phase says to paste the file):
+
+```bash
+$ cd $REPO
+$ sed -e "s|/opt/Striim/fcvae-models|$FCVAE_MODELS|g" -e "s|/opt/Striim/UploadedFiles|$FCVAE_OUT|g" \
+    striim/pipeline/fcvae_inference.tql > /tmp/fcvae_inference_local.tql
+$ sed -e "s|/opt/Striim/fcvae-models|$FCVAE_MODELS|g" -e "s|/opt/Striim/UploadedFiles|$FCVAE_OUT|g" \
+    striim/quality-agent/fcvae_monitor_manual.tql > /tmp/fcvae_monitor_local.tql
+```
+
+(Those two prefixes are the only absolute paths in either file besides the
+`/tmp/fcvae_swap_test` feed dir. The `.scm` module files have no path baked in
+at all — they can live anywhere; you upload them through the web UI in Phase 1.)
 
 > Apple Silicon note: if `uv sync` claims you are on an Intel mac
 > (`macosx_*_x86_64`), your uv or Python is an x86 binary under Rosetta
@@ -113,9 +137,9 @@ artifacts (signature, golden-set parity) and pushes the scoring params to Feast:
 ```bash
 $ cd $REPO/python
 $ uv run python -m fcvae.publish run --model Penny_All \
-    --artifacts fcvae/artifacts/Penny_All_prebuilt  --out /opt/Striim/fcvae-models/Penny_All
+    --artifacts fcvae/artifacts/Penny_All_prebuilt  --out "$FCVAE_MODELS/Penny_All"
 $ uv run python -m fcvae.publish run --model Accel_CMP \
-    --artifacts fcvae/artifacts/Accel_CMP_prebuilt --out /opt/Striim/fcvae-models/Accel_CMP
+    --artifacts fcvae/artifacts/Accel_CMP_prebuilt --out "$FCVAE_MODELS/Accel_CMP"
 ```
 
 Expected: `PASS PUBLISH gates` then `published sha256:660f8547a307` (Penny_All)
@@ -128,10 +152,12 @@ and publish still succeeds (add `--require-feast` to make it strict).
 
 1. **Re-runs only**: run the Phase 9 teardown first (on a first run every
    teardown statement fails harmlessly — skipping is fine).
-2. Open `$REPO/striim/pipeline/fcvae_inference.tql`, copy the **entire file
-   except the final `quit;` line**, and paste it into the console. The file
-   contains its own `CREATE NAMESPACE fcvaedemo;` … `DEPLOY` … `START`, so one
-   paste creates, deploys, and starts `fcvaedemo.FcvaeInference`.
+2. Open `$REPO/striim/pipeline/fcvae_inference.tql` (or
+   `/tmp/fcvae_inference_local.tql` if you relocated the data dirs in Phase 0),
+   copy the **entire file except the final `quit;` line**, and paste it into
+   the console. The file contains its own `CREATE NAMESPACE fcvaedemo;` …
+   `DEPLOY` … `START`, so one paste creates, deploys, and starts
+   `fcvaedemo.FcvaeInference`.
 3. Confirm it is running (poll a few times; deployment takes seconds):
 
 ```sql
@@ -184,8 +210,8 @@ Files (scoring output; the first window only closes after 24 event-hours fill,
 then the count settles over a few minutes):
 
 ```bash
-$ ls -l /opt/Striim/UploadedFiles/fcvae_scored*.json /opt/Striim/UploadedFiles/fcvae_accel*.json
-$ tail -c 600 "$(ls -t /opt/Striim/UploadedFiles/fcvae_scored*.json | head -1)"
+$ ls -l "$FCVAE_OUT"/fcvae_scored*.json "$FCVAE_OUT"/fcvae_accel*.json
+$ tail -c 600 "$(ls -t "$FCVAE_OUT"/fcvae_scored*.json | head -1)"
 ```
 
 Each record carries `combo_key, window_end, is_anomaly, anomaly_score,
@@ -194,8 +220,8 @@ check — polls until all 96 windows are scored:
 
 ```bash
 $ cd $REPO/python && uv run python ../striim/pipeline/check_fcvae_swap.py snapshot \
-    --base-start 2025-01-06 --shift-days 7 --min-count 96 --wait-sec 300 \
-    --out /tmp/fcvae_s7_snapshot.json
+    --pred-dir "$FCVAE_OUT" --base-start 2025-01-06 --shift-days 7 \
+    --min-count 96 --wait-sec 300 --out /tmp/fcvae_s7_snapshot.json
 ```
 
 > The newest `*.json` output file is an **open JSON array** (the closing `]`
@@ -206,7 +232,8 @@ $ cd $REPO/python && uv run python ../striim/pipeline/check_fcvae_swap.py snapsh
 ## Phase 7 — Quality monitor (optional, separate app)
 
 1. `ModelQualityAgent.scm` is already loaded (Phase 1).
-2. Open `$REPO/striim/quality-agent/fcvae_monitor_manual.tql` — a fully
+2. Open `$REPO/striim/quality-agent/fcvae_monitor_manual.tql` (or
+   `/tmp/fcvae_monitor_local.tql` if you relocated the data dirs) — a fully
    rendered monitor app (no templates, no scripts). **Edit one line**: set
    `MonRestPassword` to your admin password (plaintext works; the vault
    alternative is documented inline).
@@ -230,13 +257,16 @@ $ cp /tmp/penny_feed_test_s7.csv /tmp/fcvae_swap_test/penny_feed_test_s7.csv.tmp
 $ mv /tmp/fcvae_swap_test/penny_feed_test_s7.csv.tmp /tmp/fcvae_swap_test/penny_feed_test_s7.csv
 # emit operator labels from the same committed slice (NOT the default --source,
 # which points at the author's machine)
-$ mkdir -p /opt/Striim/UploadedFiles/ground_truth
+$ mkdir -p "$FCVAE_OUT/ground_truth"
 $ uv run python ../striim/pipeline/make_fcvae_labels.py emit \
     --start-date 2025-02-25 --days 5 --shift-days 7 \
     --source ../striim/pipeline/feeds/penny_test_5d.csv \
-    --out /opt/Striim/UploadedFiles/ground_truth/labels_s7.csv
-# join labels to scored output -> eval_metrics.json (defaults match the monitor)
-$ uv run python ../striim/pipeline/eval_labels.py run
+    --out "$FCVAE_OUT/ground_truth/labels_s7.csv"
+# join labels to scored output -> eval_metrics.json (paths must match what the
+# monitor's EvalMetricsFile points at -- they do, via the same variables)
+$ uv run python ../striim/pipeline/eval_labels.py run \
+    --pred-dir "$FCVAE_OUT" --labels-dir "$FCVAE_OUT/ground_truth" \
+    --out "$FCVAE_OUT/fcvae_eval/eval_metrics.json" --models-dir "$FCVAE_MODELS"
 ```
 
 Within a tick or two the metric families go live (PASS/WARN/FAIL relative to
@@ -244,7 +274,8 @@ each combo's published baseline). A single `run` keeps them live for 15 minutes
 (`EvalMaxAgeSec: 900` — a stale eval file deliberately reverts the families to
 UNKNOWN, since evaluator liveness *is* the staleness signal). For a continuously
 fresh demo, keep the evaluator running in its own terminal instead:
-`uv run python ../striim/pipeline/eval_labels.py watch --poll-sec 30`.
+`uv run python ../striim/pipeline/eval_labels.py watch --poll-sec 30` (plus the
+same four `--pred-dir/--labels-dir/--out/--models-dir` flags as above).
 
 ---
 
@@ -287,15 +318,16 @@ into the watched model dir):
 ```bash
 $ docker run --rm --name mqa-fcvae-trainer-run --cpus 4 \
     -v /tmp/fcvae_train_demo.csv:/work/data/synthetic_transactions.csv:ro \
-    -v /opt/Striim/fcvae-models:/out \
+    -v "$FCVAE_MODELS":/out \
     -e FCVAE_MODEL=Penny_All \
     mqa-fcvae-trainer
 ```
 
 - Swap `-e FCVAE_MODEL=Accel_CMP` to retrain the other combo; add
   `-e FCVAE_EPOCHS=N` to shorten a demo run.
-- macOS Docker Desktop: `/opt/Striim` must be added to Settings → Resources →
-  File sharing, or the `/out` mount is denied.
+- macOS Docker Desktop: `$FCVAE_MODELS` must be under a shared path
+  (Settings → Resources → File sharing; `/Users` is shared by default,
+  `/opt/...` is not), or the `/out` mount is denied.
 - A full Penny train is ~1 min in-container on the full dataset.
 
 **What happens next, automatically**: the scorer notices the new
@@ -306,10 +338,11 @@ for the new model, and/or restore the original model:
 
 ```bash
 $ cd $REPO/python
-$ uv run python -m fcvae.feast_setup push --model Penny_All      # re-point Feast at the new sha
+$ uv run python -m fcvae.feast_setup push --model Penny_All \
+    --published-dir "$FCVAE_MODELS/Penny_All"                    # re-point Feast at the new sha
 # restore the committed original at any time (hot-swaps back):
 $ uv run python -m fcvae.publish run --model Penny_All \
-    --artifacts fcvae/artifacts/Penny_All_prebuilt --out /opt/Striim/fcvae-models/Penny_All
+    --artifacts fcvae/artifacts/Penny_All_prebuilt --out "$FCVAE_MODELS/Penny_All"
 ```
 
 ---
@@ -341,9 +374,9 @@ UNLOAD OPEN PROCESSOR 'UploadedFiles/ModelQualityAgent.scm';
 Shell-side leftovers, if you want a truly clean machine:
 
 ```bash
-$ rm -rf /tmp/fcvae_swap_test /opt/Striim/fcvae-models/* \
-      /opt/Striim/UploadedFiles/fcvae_scored*.json /opt/Striim/UploadedFiles/fcvae_accel*.json \
-      /opt/Striim/UploadedFiles/fcvae_eval /opt/Striim/UploadedFiles/ground_truth
+$ rm -rf /tmp/fcvae_swap_test "$FCVAE_MODELS"/* \
+      "$FCVAE_OUT"/fcvae_scored*.json "$FCVAE_OUT"/fcvae_accel*.json \
+      "$FCVAE_OUT"/fcvae_eval "$FCVAE_OUT"/ground_truth
 ```
 
 ---
@@ -354,6 +387,7 @@ $ rm -rf /tmp/fcvae_swap_test /opt/Striim/fcvae-models/* \
 |---|---|
 | Paste fails at a `PennyToWaevent`/`AccelToWaevent` CQ | WAEUdf jar missing from `lib/` — Phase 0; restart Striim after adding |
 | App deploys but scorer OPs fail to start | Model bundles missing — Phase 3 must run before Phase 4 |
+| `No such file or directory` on a `/opt/Striim/...` path, or scorer/output lands nowhere | You relocated `$FCVAE_MODELS`/`$FCVAE_OUT` but pasted the ORIGINAL TQL (or vice versa). The pasted TQL's literals must match the dirs you publish/read — re-run the Phase 0 sed and redeploy from the `/tmp/*_local.tql` copies |
 | `LOAD` succeeds but the OP behaves like an old version | Stale module bytes pinned (an UNLOAD happened while apps used it). Teardown, **restart Striim**, LOAD, redeploy |
 | Events fed but `mon` shows `input: 0` | Poll again (read-burst propagation lag); or the file predates app start / reuses a filename — re-feed with a fresh name |
 | Scored output stops at fewer windows than expected | The last event-hour never closes in-feed (by design), and the first 23 are warm-up |
