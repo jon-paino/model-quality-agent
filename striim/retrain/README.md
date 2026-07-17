@@ -1,12 +1,13 @@
-# Retrain trigger (Week 4)
+# Retrain trigger (Week 4 + FCVAE F4)
 
 Host-side, separate from the quality agent by design (the 6-week plan's Week 4 decision;
-Week 5's agent recommendation becomes a second reason to retrain through this same path).
-The trigger reads the in-app agent's health assessments (ops gate + the cumulative
-`events_seen` the ML signals carry) and the published `model.manifest.json` (durable record
-of the last retrain), and fires `run_trainer.sh`, the canonical one-shot run of the Week 3
-`mqa-trainer` container. It writes only under `striim/retrain/state/` (gitignored), never
-into the directory ModelOp watches.
+Week 5's agent recommendation becomes a further reason to retrain through this same path).
+The trigger reads a quality agent's health assessments (ops gate + the cumulative
+`events_seen` the ML signals carry + F4's model-quality signal states) and the published
+`model.manifest.json` (durable record of the last retrain), and fires the trainer wrapper:
+`run_trainer.sh` (the Week 3 taxi `mqa-trainer` container) or `run_fcvae_trainer.sh`
+(the F4 `mqa-fcvae-trainer` container, one FCVAE combo per run). It writes only under
+`striim/retrain/state/` (gitignored), never into the directories the scorer OPs watch.
 
 ## Usage
 
@@ -36,20 +37,53 @@ closed; retraining is never authorized against an unhealthy pipeline) -> cooldow
 (`--cooldown-sec`, default 3600; applies after failures too, so a broken trainer cannot
 hot-loop) -> conditions -> fire.
 
-Conditions (fire if either): SCHEDULE due when `now - last_retrain >= --interval-sec`, where
+Conditions (fire if any): SCHEDULE due when `now - last_retrain >= --interval-sec`, where
 last_retrain is the manifest's `created_utc` (falls back to state, then bootstrap = due).
 DATA due when `events_seen - baseline >= --min-new-events`; the baseline is set on first
 sight and REBASELINED whenever the counter goes backwards (an OP redeploy resets it), with
 no data-fire allowed on the rebaseline tick, so a counter reset can only delay a fire, never
-cause one.
+cause one. METRIC (F4) due when the `--metric-signal` (an EXACT signal name from the FCVAE
+monitor's assessments, e.g. `model_f1[Penny_All]`) reads one of the `--metric-fire-on`
+states (default `WARN,FAIL`); an UNKNOWN metric (no labels dropped, stale eval file) NEVER
+fires, and an ABSENT signal refuses loudly (exit 2, misconfiguration).
+
+F4 ops-gate nuance: a model-quality FAIL drives the FCVAE monitor's verdict RED by design,
+which is precisely when the metric condition must fire. So with `--metric-signal` set, the
+ops gate is recomputed over the PLATFORM signals only (everything except the
+model_precision/model_recall/model_f1/anomaly_rate families): a platform FAIL still refuses;
+model-quality failures are the condition, not the gate. Without `--metric-signal` the gate
+is byte-identical to Week 4.
+
+When the metric condition fires, the degraded combo parsed from the signal name is exported
+to the trainer as `MQA_FCVAE_MODEL`, so `run_fcvae_trainer.sh` retrains exactly the degraded
+model (an explicit `MQA_FCVAE_MODEL` in the environment wins). Example FCVAE invocation:
+
+    python3 striim/retrain/retrain_trigger.py check \
+        --prefix fcvae_health_assessments \
+        --manifest /opt/Striim/fcvae-models/Penny_All/model.manifest.json \
+        --metric-signal 'model_f1[Penny_All]' \
+        --trainer striim/retrain/run_fcvae_trainer.sh --trainer-timeout-sec 2400 \
+        --state striim/retrain/state/fcvae_trigger_state.json \
+        --log striim/retrain/state/fcvae_trigger_log.jsonl \
+        --lock striim/retrain/state/fcvae_trigger.lock
+
+(Set `MQA_TRAINER_NAME=mqa-fcvae-trainer-run` in the trigger's environment so its timeout
+kill targets the fcvae container, not the taxi one.)
 
 Exit codes: 0 fired (or `--dry-run` would-fire); 2 refusal (no/stale assessment, ops
-unhealthy, events_seen unavailable); 3 not due (cooldown, conditions unmet, rebaseline);
-4 lock held; 5 trainer failed/timed out; 6 trainer exited 0 but the manifest is unreadable.
+unhealthy, events_seen unavailable, metric signal absent); 3 not due (cooldown, conditions
+unmet incl. UNKNOWN metric, rebaseline); 4 lock held; 5 trainer failed/timed out; 6 trainer
+exited 0 but the manifest is unreadable.
 
-Every evaluation appends one record to `state/retrain_trigger_log.jsonl` (outcome, reason,
-gates snapshot, trainer exit/duration, model versions before/after). The `reason` field is
-the Week 5 seam.
+`run_fcvae_trainer.sh` failure modes are distinctly assertable: exit 7 = docker daemon
+unreachable (Docker Desktop stopped), exit 8 = image missing (build it:
+`cd python && docker build -f Dockerfile.fcvae -t mqa-fcvae-trainer .`), exit 2 = source CSV
+missing, exit 3 = container succeeded but the manifest is unreadable.
+
+Every evaluation appends one record to the audit log (outcome, reason, gates snapshot,
+trainer exit/duration, model versions before/after). The `reason` vocabulary is
+`schedule | new_events | metric_degradation` ('+'-joined when several are due); Week 5 adds
+`requested`.
 
 ## Acceptance runbook (Week 4 bar)
 

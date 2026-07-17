@@ -1,29 +1,43 @@
 #!/usr/bin/env python3
-"""Week 4 retrain trigger: schedule or enough-new-data, closing the loop.
+"""Week 4 retrain trigger: schedule, enough-new-data, or (F4) metric
+degradation, closing the loop.
 
 Host-side and separate from the quality agent by design (the 6-week plan keeps
 the Week 4 trigger out of the agent; Week 5's agent recommendation becomes
-simply a second reason to retrain through this same path). The trigger senses
+simply another reason to retrain through this same path). The trigger senses
 through files the pipeline already writes and owns:
 
-  READS  <health-dir>/<prefix>*.json  the in-app agent's per-tick assessments
+  READS  <health-dir>/<prefix>*.json  a quality agent's per-tick assessments
          (ops gate: ops_healthy + breaker; data condition: the cumulative
-         events_seen the ML signals carry)
+         events_seen the ML signals carry; F4 metric condition: the state of
+         one model-quality signal like model_f1[Penny_All])
   READS  model.manifest.json          the durable record of the last publish
          (schedule condition reference; survives restarts)
-  RUNS   run_trainer.sh               the one-shot Week 3 container
+  RUNS   run_trainer.sh               the one-shot trainer container wrapper
+         (taxi; run_fcvae_trainer.sh for the FCVAE combos)
   WRITES its own state/lock/audit log under striim/retrain/state/ ONLY
          (never into the directory ModelOp and the FileReader watch)
 
 Gate order per evaluation: load state -> single-flight lock -> assessment
 exists and is fresh -> ops gate (never train against an unhealthy pipeline) ->
-cooldown -> conditions (schedule OR new-events) -> fire.
+cooldown -> conditions (schedule OR new-events OR metric_degradation) -> fire.
+
+F4 ops-gate nuance: a model-quality FAIL drives the FCVAE monitor's verdict
+RED (ops_healthy false, breaker open) BY DESIGN, and that is precisely the
+moment the metric condition must fire. So when --metric-signal is set, the
+ops gate is recomputed over the PLATFORM signals only (everything except the
+model_precision/model_recall/model_f1/anomaly_rate families): a platform FAIL
+(app down, source stale, node sick) still refuses, while model-quality
+failures are the condition, not the gate. Without --metric-signal the gate is
+byte-identical to the Week 4 behavior.
 
 Exit codes (check mode; each refusal is distinctly assertable):
   0  fired and the trainer succeeded (or --dry-run reached a would-fire)
-  2  refusal: no/stale assessment, ops unhealthy or breaker open, or
-     events_seen unavailable while the data condition is enabled
-  3  not due: cooldown active, no condition met, or the rebaseline tick
+  2  refusal: no/stale assessment, ops unhealthy or breaker open,
+     events_seen unavailable while the data condition is enabled, or the
+     metric signal absent while the metric condition is enabled
+  3  not due: cooldown active, no condition met (an UNKNOWN metric signal
+     NEVER fires), or the rebaseline tick
   4  lock held by a live process
   5  trainer exited nonzero or timed out
   6  post-fire anomaly (trainer exited 0 but the manifest is unreadable)
@@ -33,8 +47,13 @@ Usage:
   retrain_trigger.py watch --poll-sec N [opts] the same evaluation in a loop
 
 The audit log (one JSONL record per evaluation) carries a `reason` field
-(schedule | new_events | schedule+new_events); Week 5 adds `requested` as a
-third condition source. No approval logic lives here.
+(schedule | new_events | metric_degradation, '+'-joined when several are due);
+Week 5 adds `requested` as a further condition source. No approval logic
+lives here.
+
+When the metric condition fires, the degraded combo parsed from the signal
+name (model_f1[Penny_All] -> Penny_All) is exported to the trainer as
+MQA_FCVAE_MODEL, so run_fcvae_trainer.sh retrains exactly the degraded model.
 """
 from __future__ import annotations
 
@@ -105,6 +124,31 @@ def matches(name: str, token: str) -> bool:
     """The signal-family token rule shared with the acceptance harnesses."""
     n, t = name.lower(), token.strip().lower()
     return n == t or n.startswith(t + "[") or n.startswith(t + "_")
+
+
+# F4: the model-quality signal families the FCVAE monitor emits. They are the
+# metric CONDITION's vocabulary and are excluded from the platform-only ops
+# gate (see the module docstring).
+METRIC_FAMILIES = ("model_precision", "model_recall", "model_f1", "anomaly_rate")
+
+
+def is_metric_signal(name: str) -> bool:
+    return name.split("[", 1)[0] in METRIC_FAMILIES
+
+
+def find_signal(assessment: dict, name: str):
+    """The signal dict with this EXACT name, or None."""
+    for s in assessment.get("signals", []):
+        if s.get("name") == name:
+            return s
+    return None
+
+
+def combo_of(name: str):
+    """model_f1[Penny_All] -> Penny_All; None for un-bracketed names."""
+    if "[" in name and name.endswith("]"):
+        return name.split("[", 1)[1][:-1]
+    return None
 
 
 def events_seen_of(assessment: dict, signal_prefs: list) -> tuple:
@@ -279,11 +323,29 @@ def _evaluate_locked(args, mode: str) -> int:
     ops_healthy = a.get("ops_healthy")
     breaker_open = a.get("ops_circuit_breaker_open")
     gates.update({"ops_healthy": ops_healthy, "breaker_open": breaker_open})
-    if ops_healthy is not True or breaker_open is not False:
-        return refuse("refused_ops",
-                      f"ops gate: ops_healthy={ops_healthy} breaker_open={breaker_open}; "
-                      "retraining is not authorized while ops are unhealthy", 2)
-    print("[PASS] ops gate (healthy, breaker closed)")
+    metric_mode = bool(args.metric_signal)
+    if metric_mode:
+        # F4 platform-only recompute: a model-quality FAIL is the metric
+        # CONDITION (verdict RED by design), so only the platform signals may
+        # refuse here. The assessment's own ops booleans still ride in gates
+        # for the audit trail.
+        platform_fail = [str(s.get("name")) for s in a.get("signals", [])
+                         if not is_metric_signal(str(s.get("name", "")))
+                         and s.get("state") == "FAIL"]
+        gates.update({"ops_gate": "platform_only",
+                      "ops_platform_fail_signals": platform_fail})
+        if platform_fail:
+            return refuse("refused_ops",
+                          "ops gate (platform-only): FAILing platform signal(s) "
+                          f"{platform_fail}; retraining is not authorized over a "
+                          "sick pipeline", 2)
+        print("[PASS] ops gate (platform-only: no platform signal FAILing)")
+    else:
+        if ops_healthy is not True or breaker_open is not False:
+            return refuse("refused_ops",
+                          f"ops gate: ops_healthy={ops_healthy} breaker_open={breaker_open}; "
+                          "retraining is not authorized while ops are unhealthy", 2)
+        print("[PASS] ops gate (healthy, breaker closed)")
 
     # Gate: cooldown (applies to every real fire, success or failure).
     last_fire = parse_utc(state.get("last_fire_utc", ""))
@@ -338,7 +400,43 @@ def _evaluate_locked(args, mode: str) -> int:
                   f"(threshold {args.min_new_events})")
     gates["data_due"] = data_due
 
-    if not schedule_due and not data_due:
+    # Condition (F4): metric degradation. Fires when the chosen model-quality
+    # signal reads one of the --metric-fire-on states; an UNKNOWN metric
+    # (missing labels, stale eval file) NEVER fires. When the whole eval FILE
+    # is unavailable the monitor collapses the per-combo instances into ONE
+    # base-name UNKNOWN signal (model_f1, not model_f1[Penny_All]), so an
+    # absent exact name falls back to the base family signal; only when
+    # NEITHER exists is it a configuration error that refuses loudly.
+    metric_due = False
+    if metric_mode:
+        sig = find_signal(a, args.metric_signal)
+        if sig is None:
+            base = args.metric_signal.split("[", 1)[0]
+            sig = find_signal(a, base)
+            if sig is not None:
+                print(f"[INFO] '{args.metric_signal}' absent; using the family-level "
+                      f"signal '{base}' (file-level state)")
+        if sig is None:
+            return refuse("refused_no_metric_signal",
+                          f"metric condition enabled but signal '{args.metric_signal}' "
+                          "is absent from the assessment (is the FCVAE monitor deployed "
+                          "with the metric families enabled, and --prefix pointing at "
+                          "its sink?)", 2)
+        metric_state = str(sig.get("state", "UNKNOWN")).upper()
+        gates.update({"metric_signal": args.metric_signal,
+                      "metric_state": metric_state,
+                      "metric_value": sig.get("value")})
+        if metric_state == "UNKNOWN":
+            print(f"[FAIL] metric condition: {args.metric_signal} is UNKNOWN "
+                  f"({sig.get('detail')}); UNKNOWN never fires")
+        else:
+            metric_due = metric_state in args.metric_fire_on
+            print(f"[{'PASS' if metric_due else 'FAIL'}] metric condition: "
+                  f"{args.metric_signal}={metric_state} "
+                  f"(fires on {','.join(sorted(args.metric_fire_on))})")
+    gates["metric_due"] = metric_due
+
+    if not schedule_due and not data_due and not metric_due:
         outcome = "rebaselined" if rebaselined else "not_due"
         print("[not due] no condition met")
         append_log(args.log, {"ts": now_utc_iso(), "mode": mode, "outcome": outcome,
@@ -346,7 +444,8 @@ def _evaluate_locked(args, mode: str) -> int:
         return 3
 
     reason = "+".join([r for r, due in (("schedule", schedule_due),
-                                        ("new_events", data_due)) if due])
+                                        ("new_events", data_due),
+                                        ("metric_degradation", metric_due)) if due])
     version_before = manifest.get("model_version")
     created_before = manifest.get("created_utc")
 
@@ -365,9 +464,20 @@ def _evaluate_locked(args, mode: str) -> int:
     save_state(args.state, state)
 
     print(f"FIRED reason={reason}; running {args.trainer}")
+    # F4: hand the degraded combo to the trainer wrapper so exactly the
+    # degraded model retrains (run_fcvae_trainer.sh reads MQA_FCVAE_MODEL).
+    # An explicit MQA_FCVAE_MODEL in the environment wins over the derived
+    # one; taxi invocations (no metric fire) inherit the environment as-is.
+    trainer_env = None
+    if metric_due:
+        degraded_combo = combo_of(args.metric_signal)
+        if degraded_combo and "MQA_FCVAE_MODEL" not in os.environ:
+            trainer_env = dict(os.environ, MQA_FCVAE_MODEL=degraded_combo)
+            print(f"[INFO] degraded combo {degraded_combo} -> MQA_FCVAE_MODEL")
     t0 = time.time()
     try:
-        proc = subprocess.run([str(args.trainer)], timeout=args.trainer_timeout_sec)
+        proc = subprocess.run([str(args.trainer)], timeout=args.trainer_timeout_sec,
+                              env=trainer_env)
         exit_code = proc.returncode
     except subprocess.TimeoutExpired:
         exit_code = -1
@@ -461,6 +571,14 @@ def add_shared_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--signal", default="nan_score_rate,feature_miss_rate",
                    help="ordered preference of signals whose events_seen measures "
                         "new data (nan_score_rate counts rows that reached ModelOp)")
+    p.add_argument("--metric-signal", default="",
+                   help="F4 metric_degradation condition: the EXACT model-quality "
+                        "signal name from the FCVAE monitor's assessments (e.g. "
+                        "'model_f1[Penny_All]'); empty disables the condition and "
+                        "keeps the Week 4 behavior byte-identical")
+    p.add_argument("--metric-fire-on", default="WARN,FAIL",
+                   help="CSV of signal states that satisfy the metric condition "
+                        "(UNKNOWN never fires regardless)")
     p.add_argument("--dry-run", action="store_true",
                    help="evaluate all gates but write no state and run no trainer")
 
@@ -475,6 +593,12 @@ def main() -> int:
     w.add_argument("--poll-sec", type=int, default=60)
     args = ap.parse_args()
     args.signal = [t.strip() for t in args.signal.split(",") if t.strip()]
+    args.metric_signal = args.metric_signal.strip()
+    args.metric_fire_on = {t.strip().upper() for t in args.metric_fire_on.split(",")
+                           if t.strip()}
+    # UNKNOWN can never be a fire state: missing/stale eval data must not
+    # trigger training no matter how the option is spelled.
+    args.metric_fire_on.discard("UNKNOWN")
 
     if args.cmd == "check":
         return evaluate(args, "check")

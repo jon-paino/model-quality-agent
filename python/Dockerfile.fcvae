@@ -1,0 +1,29 @@
+# mqa-fcvae-trainer: one-shot FCVAE retrain container (train -> export ->
+# gated publish for one combo). SEPARATE image from the taxi mqa-trainer: the
+# fcvae and training extras are declared conflicting (sklearn floor), and
+# torch is heavy, so neither image pays for the other's stack.
+#
+# Build:  docker build -f Dockerfile.fcvae -t mqa-fcvae-trainer .   (cwd python/)
+# Run:    see striim/retrain/run_fcvae_trainer.sh (the canonical invocation)
+#
+# Mirrors python/Dockerfile's two-stage uv pattern. No g++: python-geohash
+# (the only sdist needing it) lives in the taxi `training` extra, not `fcvae`.
+
+FROM python:3.12-slim AS builder
+RUN pip install --no-cache-dir uv
+WORKDIR /app
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-install-project --no-dev --extra fcvae
+
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY fcvae/ fcvae/
+COPY docker/entrypoint_fcvae.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /work/data /work/artifacts /out
+ENV PATH="/app/.venv/bin:$PATH" \
+    FCVAE_MODEL=Penny_All \
+    FCVAE_DATA_CSV=/work/data/synthetic_transactions.csv \
+    FCVAE_ARTIFACTS=/work/artifacts
+ENTRYPOINT ["/entrypoint.sh"]
