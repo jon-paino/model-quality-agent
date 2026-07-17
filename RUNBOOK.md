@@ -1,316 +1,396 @@
-# RUNBOOK: running the model-quality-agent on your own Striim instance
+# FCVAE Model-Quality Demo — Runbook
 
-This walks a fresh machine from zero to both live demos (the NYC-taxi pipeline and the
-Fiserv-style FCVAE anomaly pipeline), explains WHAT HAPPENS at every step, and ends with the
-scripted acceptance suites that prove each capability. Companion doc: [ARCHITECTURE.md](ARCHITECTURE.md)
-explains how every component works and how they relate; this file is the ordered instruction set.
+Manual, console-first setup of the FCVAE anomaly-detection pipeline and its
+quality-monitoring loop on **any local Striim installation**. Every phase is
+independent and done by hand: you upload modules through the web UI, paste TQL
+into the console, and start Feast / the trainer in their own terminals. No
+deploy scripts, no REST tokens, no cluster names, no assumptions about where
+Striim is installed. Companion doc: [ARCHITECTURE.md](ARCHITECTURE.md) (how the
+components work); the taxi-demo flow lives there and in the scripted appendix.
 
-Everything below was verified live on Striim 5.2.0.4 / macOS / OpenJDK 11. Newer Striim
-releases mostly work the same; the known drift points are called out inline.
+Conventions used throughout:
+
+- `$REPO` = wherever you cloned this repository.
+- **Console** = the Tungsten console in the Striim web UI (`http://localhost:9080`,
+  log in as `admin`). Statements are pasted there unless a command block starts
+  with `$` (then it is a shell command).
+- The pipeline reads/writes two **fixed data directories**: `/opt/Striim/fcvae-models`
+  (model bundles) and `/opt/Striim/UploadedFiles` (scored output). These are plain
+  data paths baked into the TQL — they work identically whether or not your Striim
+  is actually installed at `/opt/Striim` (Phase 0 creates them).
 
 ---
 
-## 0. Prerequisites
+## Phase 0 — Prerequisites (once per machine)
 
-| What | Why |
+| Requirement | Check / how to get it |
 |---|---|
-| Striim 5.2.x installed at `/opt/Striim` (`$STRIIM_HOME`), licensed, single node | everything deploys onto it; poms resolve Striim jars via `-DSTRIIM_HOME` (default `/opt/Striim`) |
-| OpenJDK 11 + Maven | the Open Processors (OPs) are Java, built as shaded `.scm` modules |
-| [uv](https://docs.astral.sh/uv/) + Python 3.12 | the `python/` project (training, export, publish, Feast, harness tooling) |
-| Docker Desktop (running) | the one-shot trainer containers (`mqa-trainer`, `mqa-fcvae-trainer`) |
-| The sibling repo `fcvae-anomaly-detection` checked out NEXT TO this repo | the FCVAE labeled source CSV (`data/synthetic_transactions.csv`, ~473 MB) and the prebuilt model checkpoints live there. EXTERNAL BY DESIGN: they are large model/data artifacts, not code of this repo. Override the location with `FCVAE_REPO` |
-| (taxi only) the processed trips parquet | `model/data/processed/trips_cleaned.parquet`, also external; needed to train/publish the taxi model and build Feast-hitting feeds |
-
-Ports: Striim web/REST `9080`; taxi Feast `6566`; FCVAE Feast `6567`.
-
-Know these two identity facts about your cluster before anything else:
-
-- **Cluster name** = `WAClusterName` in `$STRIIM_HOME/conf/startUp.properties` (NOT the
-  `$USER`-derived name the interactive console prompt suggests). Every `console.sh` call
-  below takes it as `-c <name>`.
-- **Admin password**: the scripts never store it; they read the `STRIIM_ADMIN_PW`
-  environment variable. Export it once per shell.
+| Striim 5.2.x running locally, web UI at `localhost:9080`, admin login | `open http://localhost:9080` |
+| **WAEUdf** jar in your Striim install's `lib/` (SE add-on; the pipeline's `createWAEvent` CQs need it) | `ls <your-striim-install>/lib \| grep -i wae` — if missing, get `WAEUdf-5.2.0.jar` from the SE Confluence page (webaction.atlassian.net page 2318336001), drop it in `lib/`, **restart Striim** |
+| [uv](https://docs.astral.sh/uv/) + the Python env | `cd $REPO/python && uv sync` — base deps only; **no `--extra` is needed to run anything in this runbook** (torch is only used inside the Docker trainer) |
+| Docker (Phase 8 only) | `docker info` |
+| The fixed data directories | see below |
 
 ```bash
-export STRIIM_ADMIN_PW='<your admin password>'
-export STRIIM_CLUSTER='<your WAClusterName>'    # scripts default to the author's; override
+$ sudo mkdir -p /opt/Striim/fcvae-models /opt/Striim/UploadedFiles
+$ sudo chown "$(whoami)" /opt/Striim/fcvae-models /opt/Striim/UploadedFiles
+$ mkdir -p /tmp/fcvae_swap_test          # the feed directory the pipeline watches
 ```
 
-## 1. One-time platform setup
+Both directories must be writable by **whoever runs the Striim server** too
+(the pipeline's FileWriters create the scored JSON in `UploadedFiles`). On a
+Mac dev box where you start Striim yourself, the chown above is enough; if
+Striim runs as a service user (packaged Linux installs), chown to that user
+instead, or `chmod 775` with a shared group (`777` is fine for a throwaway
+demo box).
 
-1. **Start Striim with captured stdout** (OP diagnostics print there; the acceptance proofs
-   never depend on it, but debugging does):
+> Apple Silicon note: if `uv sync` claims you are on an Intel mac
+> (`macosx_*_x86_64`), your uv or Python is an x86 binary under Rosetta
+> (usually Migration Assistant residue). Reinstall uv natively
+> (`curl -LsSf https://astral.sh/uv/install.sh | sh`), `rm -rf python/.venv`,
+> `uv python install 3.12`, and re-sync.
 
-   ```bash
-   nohup /opt/Striim/bin/server.sh > /tmp/striim_server.log 2>&1 &
-   # ready when REST auth answers:
-   curl -s -X POST http://localhost:9080/security/authenticate \
-        --data-urlencode 'username=admin' --data-urlencode "password=$STRIIM_ADMIN_PW"
-   ```
+---
 
-2. **Create the secrets vault** (the monitors auth to Striim's own REST API through a
-   vault-resolved password; a vault cannot be named `vault`, a TQL reserved word). Do this
-   over REST, not `console.sh -f` (the latter hangs on `CREATE VAULT`):
+## Phase 1 — Load the OP modules
 
-   ```bash
-   TOK=$(curl -s -X POST 'http://localhost:9080/security/authenticate' \
-         --data-urlencode 'username=admin' --data-urlencode "password=$STRIIM_ADMIN_PW" \
-       | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-   t() { curl -s -X POST 'http://localhost:9080/api/v2/tungsten' \
-          -H "authorization: STRIIM-TOKEN $TOK" -H 'content-type: text/plain' --data "$1"; echo; }
-   t 'CREATE NAMESPACE qualitydemo;'
-   t 'CREATE VAULT qualitydemo.secrets;'
-   t "WRITE INTO qualitydemo.secrets ( vaultKey: \"striim_admin_pw\", vaultValue: \"$STRIIM_ADMIN_PW\" );"
-   ```
+The three compiled modules are **committed in this repo** — no Maven, no JDK,
+no version flags (built against the 5.2.0.4 SDK; the OP interface is stable
+across 5.2.x — if your Striim rejects them, rebuild per Appendix A):
 
-   What happens: every monitor TQL references `[qualitydemo.secrets.striim_admin_pw]`;
-   at deploy the agent resolves it via Striim's VaultAPI and uses it for its mon/REST calls.
-   An unresolvable reference is NOT a deploy failure — the agent auths with an empty
-   password and every mon/REST signal reads UNKNOWN (check `logs/striim.command.log` for
-   "password is incorrect" spam if you see all-UNKNOWN platform signals).
-
-3. **(FCVAE only) WAEUdf jar**: `WAEUdf-5.2.0.jar` must be in `/opt/Striim/lib` (the
-   fcvae TQL uses its `createWAEvent` UDF). Restart Striim after adding jars to `lib/`.
-
-4. **(taxi CDC variant only) MySQL JDBC driver**: `mysql-connector-java-8.0.30.jar` into
-   `/opt/Striim/lib` + restart (see CLAUDE.md's MySQL section; the CSV variant needs none
-   of this).
-
-5. **(optional, self-managed only) JMX health beans**: the agent's default transport is
-   mon/REST (SaaS-safe, no setup). Only if you want `HealthSource: 'JMX'` follow the
-   two-edit procedure in CLAUDE.md ("Enabling JMX").
-
-## 2. Python environment
-
-```bash
-cd python
-uv sync --extra training   # taxi stack (XGBoost, sklearn<1.6, geohash)
-# OR
-uv sync --extra fcvae      # FCVAE stack (torch 2.11, sklearn>=1.6)
-```
-
-What happens: the two extras are DECLARED CONFLICTING (incompatible sklearn floors);
-`uv sync --extra <one>` swaps the whole stack in place. Everything host-side that the
-harnesses run works under either (numpy/click/feast/onnxruntime are base deps). Intel-Mac
-note: `onnxruntime` is forked by platform marker so Intel Macs resolve `<1.24` (the last
-release with Intel-mac wheels); Apple-Silicon and Linux resolve the latest. If `uv sync`
-ever refuses on wheels, you are on an unusual platform — check the markers in
-`python/pyproject.toml`.
-
-House rule used everywhere below: run repo python via `uv` from `python/`:
-
-```bash
-py() { (cd python && uv run python "$@"); }
-```
-
-## 3. The taxi pipeline (Scenario A)
-
-Which TQL is which (asked often):
-
-| File | What it is |
+| File in repo | Module |
 |---|---|
-| `striim/pipeline/inference_pipeline.tql` | THE taxi demo app (`qualitydemo.FareInference`): CSV FileReader -> FeatureOp (Feast enrich) -> ModelOp (ONNX score + hot-swap) -> JSON sink, plus the IN-APP quality agent |
-| `striim/pipeline/inference_pipeline_mysql.tql` | same app on a MySQL CDC source (adds the `schema_evolution` DDL signal; needs `striim/mysql/` Docker setup) |
-| `striim/quality-agent/quality_monitor.tql` | standalone cross-app monitor template (`qualitymon.QualityMonitorApp`): senses ANY app over mon/REST |
+| `striim/fcvae-scorer/FCVAEOnnxScorer.scm` (31 MB) | ONNX anomaly scorer with hot-swap |
+| `striim/fcvae-params-op/FCVAEParamsOp.scm` (287 KB) | per-combo Feast params lookup |
+| `striim/quality-agent/ModelQualityAgent.scm` (40 KB) | quality monitor (Phase 7) |
 
-Bring-up order (each numbered step's effect in parentheses):
+1. In the web UI open the **Files** page and upload all three files. They land
+   in the running server's `UploadedFiles` area regardless of where Striim is
+   installed. (Filesystem alternative: `cp` them into
+   `<your-striim-install>/UploadedFiles/`.)
+2. In the console:
 
-```bash
-# 1 build + stage the three OP modules (creates UploadedFiles/<Op>.scm)
-(cd striim/feature-op && ./build.sh)
-(cd striim/model-op && ./build.sh)
-(cd striim/quality-agent && ./build.sh)
-
-# 2 load the modules (registers the OP templates in the Global namespace)
-#   via the same REST t() helper as above:
-t "LOAD OPEN PROCESSOR 'UploadedFiles/FeatureOp.scm';"
-t "LOAD OPEN PROCESSOR 'UploadedFiles/ModelOp.scm';"
-t "LOAD OPEN PROCESSOR 'UploadedFiles/ModelQualityAgent.scm';"
-
-# 3 taxi Feast online store on 6566 (FeatureOp reads it per event)
-#   needs the external parquet staged; see python/model/feature_repo
-# 4 publish the taxi model (gated: signature + golden parity; writes
-#   UploadedFiles/model.onnx + model.manifest.json ATOMICALLY, manifest first)
-py -m model.publish run
-
-# 5 deploy the app + the standalone monitor
-/opt/Striim/bin/console.sh -c "$STRIIM_CLUSTER" -u admin -p "$STRIIM_ADMIN_PW" \
-    -f striim/pipeline/inference_pipeline.tql          # note: append quit; if you edit it
-/opt/Striim/bin/console.sh -c "$STRIIM_CLUSTER" -u admin -p "$STRIIM_ADMIN_PW" \
-    -f striim/quality-agent/quality_monitor.tql
-
-# 6 feed it (FileReader tracks names: every feed needs a FRESH filename)
-py striim/pipeline/make_trip_feed.py --rows 200 --out /tmp/feed.csv
-cp /tmp/feed.csv /opt/Striim/UploadedFiles/pipeline_trips_run1.csv
+```sql
+LOAD OPEN PROCESSOR 'UploadedFiles/FCVAEOnnxScorer.scm';
+LOAD OPEN PROCESSOR 'UploadedFiles/FCVAEParamsOp.scm';
+LOAD OPEN PROCESSOR 'UploadedFiles/ModelQualityAgent.scm';
 ```
 
-What happens end to end: FeatureOp looks each event's geohash up in Feast (misses DROP the
-event: never score against silently-defaulted features); ModelOp assembles the 15-feature
-vector, scores it through an in-JVM ONNX session, stamps the prediction into `data[]` (so
-the JSON formatter can see it) and health counters into `userdata` (so the agent can); the
-in-app agent ticks every 30 s, senses the app over mon/REST, and appends one assessment
-record to `UploadedFiles/health_assessments.json`. ModelOp watches `model.onnx`'s mtime:
-publishing a new model hot-swaps it within one batch, `model.control` containing `rollback`
-reverts to the previous session (bit-exact, proven by
-`striim/pipeline/check_swap_predictions.py snapshot/compare`).
+Each must return Success.
 
-Taxi retraining loop:
+> ⚠️ If this server ever ran an **older FCVAE demo** (an existing
+> `FCVAEOnnxScorer.scm` from another repo, e.g. in a `modules/` directory):
+> loaded module bytes are pinned per module *name*, and an UNLOAD issued while
+> any app still uses the module silently pins the old classes until the server
+> restarts. Clean path: run the Phase 9 teardown, move the old `.scm` file out
+> of the way, **restart Striim**, then LOAD the new ones.
+
+---
+
+## Phase 2 — Start Feast (its own terminal)
 
 ```bash
-docker build -t mqa-trainer python/          # one-time image build
-python3 striim/retrain/retrain_trigger.py check --interval-sec 86400 --min-new-events 10000
+$ cd $REPO/python
+$ uv run python -m fcvae.feast_setup apply                 # registers the feature view (once)
+$ uv run python -m fcvae.feast_setup serve --port 6567     # leave running
 ```
 
-What happens: the trigger reads the newest assessment (gates: freshness, ops health +
-breaker, cooldown, single-flight lock), then fires `run_trainer.sh` when the schedule or
-new-events condition is due; the container trains, exports, and publishes through the same
-gates; ModelOp swaps. Exit codes are the contract (0 fired, 2 refusal, 3 not due, 4 lock,
-5 trainer failed, 6 post-fire anomaly). See `striim/retrain/README.md`.
+Port 6567 (the taxi demo owns 6566). Optional but standard: without it the
+pipeline still works — the params OP falls back to each model's swap-paired
+config (`fcvae_params_used=config_fallback` in the output instead of `feast`).
 
-## 4. The FCVAE pipeline
+> Never sweep port 6567 with a bare `lsof` kill — the OP's client sockets show
+> up too and you will kill Striim. Use `lsof -ti tcp:6567 -sTCP:LISTEN`.
 
-| File | What it is |
+---
+
+## Phase 3 — Stage the models
+
+The deployable ONNX bundles are committed (`python/fcvae/artifacts/*_prebuilt/`).
+Publish them to the directories the scorer watches — `publish` gate-checks the
+artifacts (signature, golden-set parity) and pushes the scoring params to Feast:
+
+```bash
+$ cd $REPO/python
+$ uv run python -m fcvae.publish run --model Penny_All \
+    --artifacts fcvae/artifacts/Penny_All_prebuilt  --out /opt/Striim/fcvae-models/Penny_All
+$ uv run python -m fcvae.publish run --model Accel_CMP \
+    --artifacts fcvae/artifacts/Accel_CMP_prebuilt --out /opt/Striim/fcvae-models/Accel_CMP
+```
+
+Expected: `PASS PUBLISH gates` then `published sha256:660f8547a307` (Penny_All)
+and `sha256:9adb70b4194c` (Accel_CMP). If Feast is down the push logs a WARN
+and publish still succeeds (add `--require-feast` to make it strict).
+
+---
+
+## Phase 4 — Deploy the pipeline (console)
+
+1. **Re-runs only**: run the Phase 9 teardown first (on a first run every
+   teardown statement fails harmlessly — skipping is fine).
+2. Open `$REPO/striim/pipeline/fcvae_inference.tql`, copy the **entire file
+   except the final `quit;` line**, and paste it into the console. The file
+   contains its own `CREATE NAMESPACE fcvaedemo;` … `DEPLOY` … `START`, so one
+   paste creates, deploys, and starts `fcvaedemo.FcvaeInference`.
+3. Confirm it is running (poll a few times; deployment takes seconds):
+
+```sql
+mon fcvaedemo.FcvaeInference;
+```
+
+`statusChange` must show `RUNNING`. If a mid-paste statement failed, tear down
+(Phase 9) and re-paste — don't patch a half-built app forward.
+
+---
+
+## Phase 5 — Feed it
+
+The 5-day demo feed is committed. Copy it in **after** the app is RUNNING
+(FileReader may skip files that predate app start), using the `.tmp`+`mv`
+rename so a partial copy is never read:
+
+```bash
+$ cp $REPO/striim/pipeline/feeds/penny_feed_s7.csv /tmp/fcvae_swap_test/penny_feed_s7.csv.tmp
+$ mv /tmp/fcvae_swap_test/penny_feed_s7.csv.tmp /tmp/fcvae_swap_test/penny_feed_s7.csv
+```
+
+780,693 events over 120 event-hours (2025-01-13 → 01-17), all-normal traffic.
+
+> **Feeding again later**: FileReader tracks files by *name*, and the windows
+> by *event time* — a second feed needs a fresh filename AND non-overlapping
+> event time. Generate one from the committed base, then copy it in with the
+> same `.tmp`+`mv` pattern:
+> ```bash
+> $ cd $REPO/python && uv run python ../striim/pipeline/make_fcvae_feed.py emit \
+>     --base ../striim/pipeline/feeds/penny_base_5d.csv --shift-days 14 \
+>     --out /tmp/penny_feed_s14.csv
+> $ cp /tmp/penny_feed_s14.csv /tmp/fcvae_swap_test/penny_feed_s14.csv.tmp
+> $ mv /tmp/fcvae_swap_test/penny_feed_s14.csv.tmp /tmp/fcvae_swap_test/penny_feed_s14.csv
+> ```
+
+---
+
+## Phase 6 — Verify
+
+Console:
+
+```sql
+mon fcvaedemo.TxnFileSource;     -- input/output climbing to ~780,693
+mon fcvaedemo.PennyOnnxProc;     -- output reaching 96 scored windows
+mon fcvaedemo.AccelOnnxProc;     -- output reaching 96 scored windows
+```
+
+Files (scoring output; the first window only closes after 24 event-hours fill,
+then the count settles over a few minutes):
+
+```bash
+$ ls -l /opt/Striim/UploadedFiles/fcvae_scored*.json /opt/Striim/UploadedFiles/fcvae_accel*.json
+$ tail -c 600 "$(ls -t /opt/Striim/UploadedFiles/fcvae_scored*.json | head -1)"
+```
+
+Each record carries `combo_key, window_end, is_anomaly, anomaly_score,
+threshold` (+ `fcvae_params_used` = `feast` or `config_fallback`). Definitive
+check — polls until all 96 windows are scored:
+
+```bash
+$ cd $REPO/python && uv run python ../striim/pipeline/check_fcvae_swap.py snapshot \
+    --base-start 2025-01-06 --shift-days 7 --min-count 96 --wait-sec 300 \
+    --out /tmp/fcvae_s7_snapshot.json
+```
+
+> The newest `*.json` output file is an **open JSON array** (the closing `]`
+> is only written when the file rolls) — don't feed it to a strict JSON parser.
+
+---
+
+## Phase 7 — Quality monitor (optional, separate app)
+
+1. `ModelQualityAgent.scm` is already loaded (Phase 1).
+2. Open `$REPO/striim/quality-agent/fcvae_monitor_manual.tql` — a fully
+   rendered monitor app (no templates, no scripts). **Edit one line**: set
+   `MonRestPassword` to your admin password (plaintext works; the vault
+   alternative is documented inline).
+3. Paste the file (minus the final `quit;`) into the console. It creates,
+   deploys, and starts `fcvaemon.FcvaeMonitor`.
+4. One health assessment every 30 s lands in the server's own
+   `UploadedFiles/fcvae_health_assessments*.json` and in SysOut.
+
+Expected on a fresh setup: verdict GREEN with the platform signals populated;
+the four model-metric families (`model_precision/recall/f1`, `anomaly_rate`)
+read **UNKNOWN** until an eval file exists — that is by design (never a false
+PASS). To light them up, run the ground-truth eval:
+
+```bash
+# feed the anomaly-bearing TEST slice (fresh name, non-overlapping event time)
+$ cd $REPO/python
+$ uv run python ../striim/pipeline/make_fcvae_feed.py emit \
+    --base ../striim/pipeline/feeds/penny_test_5d.csv --shift-days 7 \
+    --out /tmp/penny_feed_test_s7.csv
+$ cp /tmp/penny_feed_test_s7.csv /tmp/fcvae_swap_test/penny_feed_test_s7.csv.tmp
+$ mv /tmp/fcvae_swap_test/penny_feed_test_s7.csv.tmp /tmp/fcvae_swap_test/penny_feed_test_s7.csv
+# emit operator labels from the same committed slice (NOT the default --source,
+# which points at the author's machine)
+$ mkdir -p /opt/Striim/UploadedFiles/ground_truth
+$ uv run python ../striim/pipeline/make_fcvae_labels.py emit \
+    --start-date 2025-02-25 --days 5 --shift-days 7 \
+    --source ../striim/pipeline/feeds/penny_test_5d.csv \
+    --out /opt/Striim/UploadedFiles/ground_truth/labels_s7.csv
+# join labels to scored output -> eval_metrics.json (defaults match the monitor)
+$ uv run python ../striim/pipeline/eval_labels.py run
+```
+
+Within a tick or two the metric families go live (PASS/WARN/FAIL relative to
+each combo's published baseline). A single `run` keeps them live for 15 minutes
+(`EvalMaxAgeSec: 900` — a stale eval file deliberately reverts the families to
+UNKNOWN, since evaluator liveness *is* the staleness signal). For a continuously
+fresh demo, keep the evaluator running in its own terminal instead:
+`uv run python ../striim/pipeline/eval_labels.py watch --poll-sec 30`.
+
+---
+
+## Phase 8 — Retrain in Docker (optional, its own terminal)
+
+Build the trainer image (once):
+
+```bash
+$ cd $REPO/python && docker build -f Dockerfile.fcvae -t mqa-fcvae-trainer .
+```
+
+**Training data.** The trainer needs a labeled transactions CSV with a
+`split` column. Two options:
+
+- **Full quality**: the original ~496 MB `synthetic_transactions.csv`
+  (external — lives in the `fcvae-anomaly-detection` repo; ask the author).
+- **Demo-grade, fully self-contained**: derive one from the committed 5-day
+  slice. The slice is 100% `split=train`, which the trainer cannot use as-is
+  (empty validation split crashes epoch 1), so rewrite the split by day first:
+
+```bash
+$ cd $REPO/python && uv run python - <<'EOF'
+import pandas as pd
+df = pd.read_csv('../striim/pipeline/feeds/penny_base_5d.csv', parse_dates=['timestamp'])
+day = df['timestamp'].dt.strftime('%Y-%m-%d')
+df['split'] = 'train'
+df.loc[day == '2025-01-09', 'split'] = 'val'
+df.loc[day == '2025-01-10', 'split'] = 'test'
+df.to_csv('/tmp/fcvae_train_demo.csv', index=False)
+print(df['split'].value_counts().to_dict())
+EOF
+```
+
+  (~97 total windows, ~70 of them training, vs ~1400 in the full dataset —
+  fine for demonstrating the retrain → hot-swap loop, not for model quality.)
+
+Run the trainer (train → ONNX export with parity gate → gated publish straight
+into the watched model dir):
+
+```bash
+$ docker run --rm --name mqa-fcvae-trainer-run --cpus 4 \
+    -v /tmp/fcvae_train_demo.csv:/work/data/synthetic_transactions.csv:ro \
+    -v /opt/Striim/fcvae-models:/out \
+    -e FCVAE_MODEL=Penny_All \
+    mqa-fcvae-trainer
+```
+
+- Swap `-e FCVAE_MODEL=Accel_CMP` to retrain the other combo; add
+  `-e FCVAE_EPOCHS=N` to shorten a demo run.
+- macOS Docker Desktop: `/opt/Striim` must be added to Settings → Resources →
+  File sharing, or the `/out` mount is denied.
+- A full Penny train is ~1 min in-container on the full dataset.
+
+**What happens next, automatically**: the scorer notices the new
+`model.onnx` mtime and hot-swaps weights+threshold together, zero downtime.
+The Feast rows still carry the *old* model's version, so the skew guard makes
+the scorer use the swap-paired config (correct immediately). Re-engage Feast
+for the new model, and/or restore the original model:
+
+```bash
+$ cd $REPO/python
+$ uv run python -m fcvae.feast_setup push --model Penny_All      # re-point Feast at the new sha
+# restore the committed original at any time (hot-swaps back):
+$ uv run python -m fcvae.publish run --model Penny_All \
+    --artifacts fcvae/artifacts/Penny_All_prebuilt --out /opt/Striim/fcvae-models/Penny_All
+```
+
+---
+
+## Phase 9 — Teardown / clean slate
+
+Paste into the console **in this order** (apps before namespaces before
+UNLOADs — an UNLOAD while an app still uses the module pins the old bytes
+until a restart). Every statement fails harmlessly if the object doesn't exist:
+
+```sql
+STOP APPLICATION fcvaedemo.FcvaeInference;
+UNDEPLOY APPLICATION fcvaedemo.FcvaeInference;
+DROP APPLICATION fcvaedemo.FcvaeInference CASCADE;
+
+STOP APPLICATION fcvaemon.FcvaeMonitor;
+UNDEPLOY APPLICATION fcvaemon.FcvaeMonitor;
+DROP APPLICATION fcvaemon.FcvaeMonitor CASCADE;
+
+use admin;
+DROP NAMESPACE fcvaedemo CASCADE;
+DROP NAMESPACE fcvaemon CASCADE;
+
+UNLOAD OPEN PROCESSOR 'UploadedFiles/FCVAEOnnxScorer.scm';
+UNLOAD OPEN PROCESSOR 'UploadedFiles/FCVAEParamsOp.scm';
+UNLOAD OPEN PROCESSOR 'UploadedFiles/ModelQualityAgent.scm';
+```
+
+Shell-side leftovers, if you want a truly clean machine:
+
+```bash
+$ rm -rf /tmp/fcvae_swap_test /opt/Striim/fcvae-models/* \
+      /opt/Striim/UploadedFiles/fcvae_scored*.json /opt/Striim/UploadedFiles/fcvae_accel*.json \
+      /opt/Striim/UploadedFiles/fcvae_eval /opt/Striim/UploadedFiles/ground_truth
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
 |---|---|
-| `striim/pipeline/fcvae_inference.tql` | the FCVAE app (`fcvaedemo.FcvaeInference`): one CSV source fanning into two mirrored chains (`Penny_All` pooled sub-dollar series, `Accel_CMP` combo series), each = hourly window -> 24-row sliding window -> FCVAEParamsOp (Feast per-combo params) -> FCVAEOnnxScorer (NLL + decision + hot-swap) -> JSON sink. DO NOT deploy raw: use `deploy_fcvae.sh` |
-| `striim/quality-agent/fcvae_monitor.tql` | the FCVAE monitor TEMPLATE (`fcvaemon.FcvaeMonitor`), `@TOKENS@` rendered by `deploy_fcvae_monitor.sh`. DO NOT deploy raw |
+| Paste fails at a `PennyToWaevent`/`AccelToWaevent` CQ | WAEUdf jar missing from `lib/` — Phase 0; restart Striim after adding |
+| App deploys but scorer OPs fail to start | Model bundles missing — Phase 3 must run before Phase 4 |
+| `LOAD` succeeds but the OP behaves like an old version | Stale module bytes pinned (an UNLOAD happened while apps used it). Teardown, **restart Striim**, LOAD, redeploy |
+| Events fed but `mon` shows `input: 0` | Poll again (read-burst propagation lag); or the file predates app start / reuses a filename — re-feed with a fresh name |
+| Scored output stops at fewer windows than expected | The last event-hour never closes in-feed (by design), and the first 23 are warm-up |
+| `fcvae_params_used: config_fallback` everywhere | Feast down (Phase 2) or version skew after a retrain — `feast_setup push --model <X>` |
+| One transient Feast 500 per feed burst | Normal (server restart edge); the OP retries |
+| `LIST OPENPROCESSORS;` doesn't show a loaded module | It lists *instances*, not modules, on 5.2.0.4 — deploy an app that uses it to see it |
+| uv says Intel mac on Apple Silicon | Rosetta toolchain — see Phase 0 note |
 
-Bring-up:
+---
 
-```bash
-# 1 the FCVAE Feast instance (per-combo scoring params, port 6567; the taxi
-#   one on 6566 is never touched)
-py -m fcvae.feast_setup apply
-(cd python && nohup uv run python -m fcvae.feast_setup serve --port 6567 \
-    > /tmp/fcvae_feast.log 2>&1 &)
+## Appendix A — Rebuilding the modules from source
 
-# 2 export the prebuilt checkpoints from the sibling repo to ONNX artifacts
-#   (parity-gated; ~1 min each) and publish them as the live models
-py -m fcvae.onnx_export export --model Penny_All \
-    --model-dir ../fcvae-anomaly-detection/models/fcvae/Penny_All \
-    --out-dir fcvae/artifacts/Penny_All_prebuilt
-py -m fcvae.onnx_export export --model Accel_CMP \
-    --model-dir ../fcvae-anomaly-detection/models/fcvae/Accel_CMP \
-    --out-dir fcvae/artifacts/Accel_CMP_prebuilt
-py -m fcvae.publish run --model Penny_All  --artifacts fcvae/artifacts/Penny_All_prebuilt \
-    --out /opt/Striim/fcvae-models/Penny_All --require-feast
-py -m fcvae.publish run --model Accel_CMP --artifacts fcvae/artifacts/Accel_CMP_prebuilt \
-    --out /opt/Striim/fcvae-models/Accel_CMP --require-feast
-
-# 3 deploy the pipeline (idempotent: teardown, rebuild both scms, LOAD, TQL, poll RUNNING)
-striim/pipeline/deploy_fcvae.sh
-
-# 4 deploy the monitor. FIRST TIME (or after any agent-code change) use the
-#   module-reload cycle, which briefly redeploys the taxi apps sharing the scm:
-striim/pipeline/deploy_fcvae_monitor.sh --reload-module
-#   ... later redeploys (changed thresholds/signals) are app-only:
-FCVAE_MON_ENABLED_SIGNALS='...' striim/pipeline/deploy_fcvae_monitor.sh
-
-# 5 feed it: 5-day slices of the labeled source, time-shifted so each feed is
-#   new in event time but bit-identical per hour (the swap-proof protocol)
-py striim/pipeline/make_fcvae_feed.py prepare --start-date 2025-02-25 --days 5 \
-    --out striim/pipeline/feeds/penny_test_5d.csv        # TEST range: has real anomalies
-py striim/pipeline/make_fcvae_feed.py emit --base striim/pipeline/feeds/penny_test_5d.csv \
-    --shift-days 0 --out /tmp/fcvae_swap_test/penny_feed_s0.csv.tmp
-mv /tmp/fcvae_swap_test/penny_feed_s0.csv.tmp /tmp/fcvae_swap_test/penny_feed_s0.csv
-
-# 6 ground-truth eval: generate labels for the slice (in prod these come from
-#   case dispositions), then join them against the scored output
-py striim/pipeline/make_fcvae_labels.py emit --start-date 2025-02-25 --days 5 \
-    --shift-days 0 --out /opt/Striim/UploadedFiles/ground_truth/fcvae_labels_s0.csv
-py striim/pipeline/eval_labels.py run     # -> UploadedFiles/fcvae_eval/eval_metrics.json
-```
-
-What happens: the scorer flags a window when its last-point NLL score is BELOW the
-threshold (lower NLL = more anomalous; decisions are inverted relative to intuition).
-`eval_labels.py` joins labels to scored windows on `(combo_key, hour)`, computes raw and
-point-adjusted precision/recall/F1 plus a labels-free anomaly rate, embeds each combo's
-published manifest baseline, and writes `eval_metrics.json` atomically. The monitor turns
-that file into per-combo signals (`model_f1[Penny_All]`...) judged RELATIVE to each model's
-own accepted baseline; a stale or missing file reads UNKNOWN, never a false PASS.
-
-Quality-triggered retraining (the F4 loop):
+Only needed if you change OP code or your Striim version rejects the committed
+modules. Requires JDK 11 + Maven and a local Striim install (the poms resolve
+system-scoped Striim jars from it):
 
 ```bash
-(cd python && docker build -f Dockerfile.fcvae -t mqa-fcvae-trainer .)   # one-time
-MQA_TRAINER_NAME=mqa-fcvae-trainer-run \
-python3 striim/retrain/retrain_trigger.py check \
-    --prefix fcvae_health_assessments \
-    --manifest /opt/Striim/fcvae-models/Penny_All/model.manifest.json \
-    --metric-signal 'model_f1[Penny_All]' \
-    --trainer striim/retrain/run_fcvae_trainer.sh --trainer-timeout-sec 2400 \
-    --state striim/retrain/state/fcvae_trigger_state.json \
-    --log striim/retrain/state/fcvae_trigger_log.jsonl \
-    --lock striim/retrain/state/fcvae_trigger.lock
+$ cd $REPO/striim/fcvae-scorer     # same for fcvae-params-op, quality-agent
+$ mvn clean package -DSTRIIM_HOME=<your-striim-install> -DSTRIIM_VERSION=<your version, e.g. 5.2.0.4>
+$ cp target/FCVAEOnnxScorer.jar <anywhere>/FCVAEOnnxScorer.scm   # then upload + LOAD as in Phase 1
 ```
 
-What happens: the trigger fires when `model_f1[Penny_All]` reads WARN/FAIL (an UNKNOWN
-metric never fires); the ops gate is recomputed over PLATFORM signals only, since a
-model-quality FAIL turns the verdict RED by design (that is the condition, not the gate);
-the degraded combo is passed to the container as `MQA_FCVAE_MODEL`; the container trains
-(minutes), exports, publishes through six gates; the scorer hot-swaps; the retrained
-`model_version` automatically invalidates any stale Feast row via the skew guard. Docker
-down reads as the wrapper's exit 7, missing image as exit 8, with actionable messages.
+`<your version>` must match `ls <install>/lib/Platform-*.jar`. The taxi-demo
+OPs (`model-op`, `feature-op`) build the same way.
 
-## 5. The proof suites (run these to trust your install)
+## Appendix B — Scripted deploy (author machine) and the taxi demo
 
-Each harness is self-contained (fresh teardown, deterministic assertions, PASS/FAIL
-summary, nonzero exit on any failure). Expected wall-clock on a laptop in parentheses.
+The pre-rewrite automated flow still exists for the acceptance harnesses:
+`striim/pipeline/deploy_fcvae.sh` (env: `STRIIM_ADMIN_PW`, `STRIIM_CLUSTER`,
+`STRIIM_HOME`, `STRIIM_BASE_URL`) and `striim/pipeline/deploy_fcvae_monitor.sh`
+(renders the `fcvae_monitor.tql` template — the manual variant used in Phase 7
+is its pre-rendered equivalent). The acceptance suites
+(`striim/pipeline/run_f*_acceptance.sh`) drive everything end to end and
+require the uv `fcvae` extra plus, for some phases, the external source CSV.
 
-| Harness | Proves | Time |
-|---|---|---|
-| `python/fcvae/test/run_f0_acceptance.sh` | vendored FCVAE trains/exports; single-file ONNX bit-exact vs the sibling repo; ORT-Java loads the FFT graph (~5 min) |
-| `striim/pipeline/run_f1_acceptance.sh` | scorer hot-swap: bad-signature rejections bit-exact, swap changes 96/96 scores, rollback bit-exact, touch re-promotion (~15 min) |
-| `striim/pipeline/run_f2_acceptance.sh` | Feast per-combo params: threshold flip with bit-identical scores, version skew guard, Feast-down fallback, restore; per-combo isolation (~15 min) |
-| `striim/pipeline/run_f3_acceptance.sh` | ground-truth eval: pinned exact P/R/F1 + independent recomputation, monitor metric signals, staleness/toggle negatives, drift-to-RED and exact recovery (~20 min) |
-| `striim/pipeline/run_f4_acceptance.sh` | the full quality-triggered retrain loop incl. all negatives and the docker error modes (~20 min) |
-| `striim/pipeline/check_monrest_acceptance.py`, `check_toggles_acceptance.py`, `striim/mysql/run_ddl_acceptance.sh` | taxi-side: mon/REST signal sourcing, EnabledSignals toggles, CDC schema-evolution signal |
-
-All need `STRIIM_ADMIN_PW` exported; F3/F4 assume the F3-era agent module is LOADED (the
-F3 harness's deploy step does the shared-module reload itself; F4 accepts
-`F4_RELOAD_MODULE=1` if you skipped F3).
-
-## 6. Demo script (the acts, condensed)
-
-1. **Health verdicts**: `quality_monitor.tql` pointed at any app; show GREEN -> stop the
-   feed -> freshness WARN/FAIL -> YELLOW/RED with per-signal rationale.
-2. **Toggles**: redeploy the monitor with a family removed from `EnabledSignals`; it
-   vanishes from `signals[]` and appears in `disabled_signals` (policy, not amnesia).
-3. **Gated publish + rejection + rollback** (either pipeline): publish a good model (swap
-   proven by prediction diff), attempt a bad-signature model (bit-exact refusal), rollback
-   via the control file (bit-exact revert).
-4. **Feast-only flip** (FCVAE): push a new threshold; every decision changes while scores
-   stay bit-identical; the poisoned-version and Feast-down cases fall back per event.
-5. **Ground-truth eval** (FCVAE): drop a label file, run `eval_labels.py`, watch
-   `model_f1[Penny_All]` go non-UNKNOWN with values matching the eval file.
-6. **Quality-triggered retrain** (FCVAE): flip the threshold to degrade F1 -> monitor RED ->
-   trigger fires `metric_degradation` -> container retrains the degraded combo -> swap +
-   recovery against the new model's own baseline. (This is `run_f4_acceptance.sh` phases
-   C-F, runnable live in ~10 minutes.)
-
-## 7. Troubleshooting (the expensive lessons, condensed)
-
-- **OP code changes not taking effect**: NEVER `UNLOAD` a module while apps still use it —
-  on 5.2.0.4 that pins the old class bytes for the server lifetime (later UNLOAD/LOADs
-  report Success and still serve stale classes; even restart recovery reproduces them while
-  the apps exist). Iterate with: drop the apps using the OP, UNLOAD, LOAD, redeploy; if
-  already pinned: drop apps, UNLOAD, RESTART Striim, LOAD, redeploy.
-  `deploy_fcvae_monitor.sh --reload-module` automates the safe order and sha-verifies the
-  module cache (`$STRIIM_HOME/.striim/OpenProcessor/`) after LOAD.
-- **Killing processes on the Feast port**: always `lsof -ti tcp:6567 -sTCP:LISTEN`. A bare
-  `lsof -ti tcp:6567` also matches the STRIIM SERVER's client sockets (the params OP keeps
-  HTTP keep-alives) and killing that list kills Striim.
-- **FileReader**: tracks files by NAME; re-feeding needs a fresh filename; write feeds to a
-  `.tmp` name then `mv` (never let it see a partial file); `positionByEOF: false` reads
-  matching files from the start on (re)deploy.
-- **FileWriter filenames must EMBED `.json`** (`x.json` rolls to `x.00.json`; a bare `x`
-  rolls extensionless and every `*.json` glob misses it). JSONFormatter files are OPEN
-  arrays until they roll: parse them tolerantly (every checker here does).
-- **Feast transients**: one failed lookup per ~96-request burst against the local server is
-  NORMAL (the OP retries once; per-event config fallback is the designed degradation).
-  Never assert uniform-100% on a Feast-served phase.
-- **Docker failure modes** (fcvae trainer wrapper): exit 7 = daemon down, exit 8 = image
-  missing, 2 = data missing, 3 = broken publish contract.
-- **Transient node CPU FAILs**: scoring bursts can peg `node_cpu_pct` for a tick; anything
-  asserting on verdicts must poll for the settled state, not sample one tick.
-- **After a Striim restart**: re-establish the live model identity (fresh publish) before
-  trusting prediction comparisons; app-recovery races make old baselines unreliable.
+The NYC-taxi demo (`qualitydemo.FareInference`: FeatureOp → ModelOp with the
+in-app agent) is documented in [ARCHITECTURE.md](ARCHITECTURE.md); its wiring
+follows the same manual pattern (build/upload/LOAD the `model-op`, `feature-op`,
+`quality-agent` modules, Feast on 6566, paste
+`striim/pipeline/inference_pipeline.tql`).

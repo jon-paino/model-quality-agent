@@ -4,11 +4,17 @@ reference-OPs/
 docs/
 chat-context/
 
-# Java / Maven build output. The deployable .scm is rebuilt from source against a
-# local $STRIIM_HOME (see README); it is NOT committed here (ModelOp.scm is ~41 MB).
+# Java / Maven build output. Most .scm modules are rebuilt from source against a
+# local $STRIIM_HOME (see README) -- EXCEPT the three FCVAE-path modules below,
+# which are committed prebuilt so the manual RUNBOOK needs no Maven/JDK/version
+# matching (upload + LOAD and go). Rebuild + re-copy them when their OP source
+# changes (Appendix A of RUNBOOK.md).
 target/
 *.scm
 *.jar
+!striim/fcvae-scorer/FCVAEOnnxScorer.scm
+!striim/fcvae-params-op/FCVAEParamsOp.scm
+!striim/quality-agent/ModelQualityAgent.scm
 
 # Regenerable ONNX swap-test artifacts (emitted by make_swap_artifacts.py)
 striim/model-op/test/artifacts/
