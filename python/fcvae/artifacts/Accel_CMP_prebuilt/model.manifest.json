@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "model_version": "sha256:9adb70b4194c",
+  "onnx_sha256": "9adb70b4194c02c517b7545de76c8705d6d2d78789a73ea32d27286ba64b99d9",
+  "created_utc": "2026-07-17T13:15:14+00:00",
+  "model_file": "model.onnx",
+  "model_name": "Accel_CMP",
+  "input": {
+    "name": "input",
+    "dtype": "float32",
+    "shape": [
+      -1,
+      1,
+      24
+    ]
+  },
+  "output": {
+    "name": "nll",
+    "dtype": "float32",
+    "shape": [
+      -1,
+      24
+    ]
+  },
+  "scaler": {
+    "type": "StandardScaler",
+    "mean": 1632.758845899471,
+    "scale": 980.5461869277427
+  },
+  "thresholds": {
+    "last_point_threshold": -0.2975213015079498,
+    "point_threshold": -0.8674829751253126,
+    "window_threshold": 0.5732355284690857
+  },
+  "eval": {
+    "split": "test",
+    "n_windows": 217,
+    "n_anomalous_last_points": 21,
+    "threshold": -0.2975213015079498,
+    "raw_last_point": {
+      "precision": 0.29411764705882354,
+      "recall": 0.7142857142857143,
+      "f1": 0.4166666666666667,
+      "tp": 15,
+      "fp": 36,
+      "fn": 6
+    },
+    "point_adjusted_last_point": {
+      "precision": 0.32075471698113206,
+      "recall": 0.8095238095238095,
+      "f1": 0.45945945945945943,
+      "tp": 17,
+      "fp": 36,
+      "fn": 4,
+      "tp_segments": 5,
+      "fn_segments": 1,
+      "total_segments": 6
+    },
+    "scored_with": "onnxruntime",
+    "data_csv": "/Users/jonpaino/Documents/Striim/fcvae-anomaly-detection/data/synthetic_transactions.csv",
+    "data_span": {
+      "start": "2025-02-25T00:00:00",
+      "end": "2025-03-06T23:00:00"
+    }
+  },
+  "parity": {
+    "checked": 100,
+    "max_abs_err": 0.00022125244140625,
+    "mean_abs_err": 1.3261602725833653e-06,
+    "decision_agreement": 1.0,
+    "gates": {
+      "agreement_min": 1.0,
+      "mean_abs_tol": 0.001,
+      "max_abs_tol": 1.0
+    },
+    "pass": true
+  },
+  "data_source": {
+    "type": "file",
+    "csv": "/Users/jonpaino/Documents/Striim/fcvae-anomaly-detection/data/synthetic_transactions.csv"
+  }
+}

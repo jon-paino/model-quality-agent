@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "model_version": "sha256:660f8547a307",
+  "onnx_sha256": "660f8547a30769317fa58df96bca4de77a1f21068bff53fd6acec2a6af945060",
+  "created_utc": "2026-07-17T13:19:14+00:00",
+  "model_file": "model.onnx",
+  "model_name": "Penny_All",
+  "input": {
+    "name": "input",
+    "dtype": "float32",
+    "shape": [
+      -1,
+      1,
+      24
+    ]
+  },
+  "output": {
+    "name": "nll",
+    "dtype": "float32",
+    "shape": [
+      -1,
+      24
+    ]
+  },
+  "scaler": {
+    "type": "StandardScaler",
+    "mean": 126.02559027777778,
+    "scale": 42.8340232353508
+  },
+  "thresholds": {
+    "last_point_threshold": -21.3322,
+    "point_threshold": -21.3322,
+    "window_threshold": -1.3496712446212769
+  },
+  "eval": {
+    "split": "test",
+    "n_windows": 217,
+    "n_anomalous_last_points": 14,
+    "threshold": -21.3322,
+    "raw_last_point": {
+      "precision": 0.9333333333333333,
+      "recall": 1.0,
+      "f1": 0.9655172413793104,
+      "tp": 14,
+      "fp": 1,
+      "fn": 0
+    },
+    "point_adjusted_last_point": {
+      "precision": 0.9333333333333333,
+      "recall": 1.0,
+      "f1": 0.9655172413793104,
+      "tp": 14,
+      "fp": 1,
+      "fn": 0,
+      "tp_segments": 3,
+      "fn_segments": 0,
+      "total_segments": 3
+    },
+    "scored_with": "onnxruntime",
+    "data_csv": "/Users/jonpaino/Documents/Striim/fcvae-anomaly-detection/data/synthetic_transactions.csv",
+    "data_span": {
+      "start": "2025-02-25T00:00:00",
+      "end": "2025-03-06T23:00:00"
+    }
+  },
+  "parity": {
+    "checked": 100,
+    "max_abs_err": 0.16552734375,
+    "mean_abs_err": 9.869476275828977e-05,
+    "decision_agreement": 1.0,
+    "gates": {
+      "agreement_min": 1.0,
+      "mean_abs_tol": 0.001,
+      "max_abs_tol": 1.0
+    },
+    "pass": true
+  },
+  "data_source": {
+    "type": "file",
+    "csv": "/Users/jonpaino/Documents/Striim/fcvae-anomaly-detection/data/synthetic_transactions.csv"
+  }
+}
