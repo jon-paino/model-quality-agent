@@ -12,9 +12,14 @@ dependencies = [
     "pyarrow>=15,<19",
     # Feature store (sqlite online + file offline per feature_repo/feature_store.yaml; no redis needed)
     "feast>=0.40,<0.42",
-    # ONNX (swap-test artifact generation in striim/model-op/test/make_swap_artifacts.py)
+    # ONNX (swap-test artifact generation in striim/model-op/test/make_swap_artifacts.py).
+    # onnxruntime dropped Intel-mac wheels after 1.23.2, so the dependency is
+    # forked by platform marker: Intel macs cap at <1.24 while every other
+    # platform resolves the latest (uv would otherwise pick a version with no
+    # macosx_x86_64 wheel and refuse to sync on Intel macs).
     "onnx>=1.16,<2",
-    "onnxruntime>=1.18,<2",
+    "onnxruntime>=1.18,<2; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime>=1.18,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     # CLI (feast_writer / feast_streamer / features / feast_setup)
     "click>=8.1,<9",
     # MySQL CDC loader (striim/pipeline/load_mysql_trips.py uses mysql+pymysql via SQLAlchemy)

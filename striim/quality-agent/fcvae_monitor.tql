@@ -1,0 +1,117 @@
+-- ===================================================================
+-- FCVAE Quality Monitor (F3): standalone cross-app monitor for
+-- fcvaedemo.FcvaeInference, cloned from quality_monitor.tql.
+--
+-- Adds the four F3 model-quality signal families (model_precision,
+-- model_recall, model_f1, anomaly_rate), read from the eval_metrics.json the
+-- host-side evaluator (striim/pipeline/eval_labels.py) writes. Metric floors
+-- are RELATIVE to each combo's published baseline (the manifest's accepted
+-- point-adjusted eval, embedded in the eval file); anomaly_rate is an
+-- absolute ceiling. A missing/stale eval file reads UNKNOWN, never a false
+-- PASS.
+--
+-- This file is a TEMPLATE: @TOKENS@ are rendered by
+-- striim/pipeline/deploy_fcvae_monitor.sh (env-overridable defaults there).
+-- Deploy through that script, not raw console.sh. The script pre-drops the
+-- fcvaemon namespace, so CREATE NAMESPACE below always succeeds (a failed
+-- CREATE NAMESPACE aborts console.sh -f on 5.2.0.4).
+--
+-- ML (feature_miss_rate / nan_score_rate) and schema_evolution stay OFF:
+-- the FCVAE OPs register no OpCounter MBeans and the pipeline's FileReader
+-- source has no DDL surface, so they would be permanent UNKNOWN noise.
+-- backpressure / discarded_events stay ON for honest UNKNOWN visibility,
+-- matching qualitymon.
+--
+-- Source/target freshness thresholds are RAISED vs the taxi defaults
+-- (demo feeds are episodic; the pipeline idles between shifted feeds), so
+-- GREEN/RED verdicts stay attributable to the metric signals.
+-- ===================================================================
+
+CREATE NAMESPACE fcvaemon;
+USE fcvaemon;
+
+CREATE APPLICATION FcvaeMonitor;
+
+-- Input stream: exists ONLY to satisfy OP wiring; nothing feeds it (the agent
+-- is timer-driven). The unfed-stream deploy is proven by qualitymon.
+CREATE STREAM FcvaeHeartbeatStream OF Global.WAEvent;
+
+CREATE STREAM FcvaeAssessmentStream OF Global.WAEvent;
+
+CREATE OPEN PROCESSOR FcvaeQualityMonitor USING Global.ModelQualityAgent (
+  TargetNamespace: 'fcvaedemo',
+  TargetAppName: 'FcvaeInference',
+  TickIntervalSec: @TICK_SEC@,
+  HealthSource: 'MON_REST',
+  MonRestBaseUrl: 'http://localhost:9080',
+  MonRestUser: 'admin',
+  -- Cross-namespace vault reference (proven by qualitymon; the vault lives in
+  -- qualitydemo and cannot be named "vault", a TQL reserved word).
+  MonRestPassword: '[qualitydemo.secrets.striim_admin_pw]',
+  MonRestTimeoutSec: 5,
+  EnabledSignals: '@ENABLED_SIGNALS@',
+  -- F3 eval-file metric signals
+  EvalMetricsFile: '@EVAL_FILE@',
+  EvalMaxAgeSec: @EVAL_MAX_AGE_SEC@,
+  EvalCombos: '@EVAL_COMBOS@',
+  MetricWarnBelowBaselinePct: @METRIC_WARN_PCT@,
+  MetricFailBelowBaselinePct: @METRIC_FAIL_PCT@,
+  AnomalyRateWarnPct: @RATE_WARN_PCT@,
+  AnomalyRateFailPct: @RATE_FAIL_PCT@,
+  -- Platform policy (freshness raised for the episodically-fed demo pipeline)
+  SourceFreshnessWarnSec: @SRC_WARN_SEC@,
+  SourceFreshnessFailSec: @SRC_FAIL_SEC@,
+  TargetWriteWarnSec: @TGT_WARN_SEC@,
+  TargetWriteFailSec: @TGT_FAIL_SEC@,
+  LagWarnMs: 5000,
+  LagFailMs: 30000,
+  MemoryFreeWarnGb: 2,
+  MemoryFreeFailGb: 1,
+  CpuWarnPct: 85,
+  CpuFailPct: 95,
+  EnableLogging: true
+)
+INSERT INTO FcvaeAssessmentStream
+FROM FcvaeHeartbeatStream;
+
+-- Live view of every assessment tick (renders userdata).
+CREATE TARGET FcvaeQualitySysOut USING Global.SysOut (
+  name: 'FcvaeMonitor'
+)
+INPUT FROM FcvaeAssessmentStream;
+
+-- Capturable output: the standard 10-column data[] projection (a formatter
+-- cannot read userdata). Identical contract to the taxi agents; the
+-- assessment_json string is the typed truth the checkers parse.
+CREATE CQ FormatFcvaeHealth
+INSERT INTO FcvaeHealthOutStream
+SELECT
+  TO_STRING(data[0]) AS tick_ts,
+  TO_STRING(data[1]) AS verdict,
+  TO_STRING(data[2]) AS ops_healthy,
+  TO_STRING(data[3]) AS ops_circuit_breaker_open,
+  TO_STRING(data[4]) AS rationale,
+  TO_STRING(data[5]) AS signal_count,
+  TO_STRING(data[6]) AS fail_count,
+  TO_STRING(data[7]) AS warn_count,
+  TO_STRING(data[8]) AS assessment_json,
+  TO_STRING(data[9]) AS target_app
+FROM FcvaeAssessmentStream;
+
+-- One JSON record per tick. Filename EMBEDS .json (house rule: it rolls to
+-- fcvae_health_assessments.00.json; an extensionless name would roll
+-- extensionless and every *.json glob would miss it). The prefix is disjoint
+-- from health_assessments* and quality_monitor_assessments*.
+CREATE TARGET FcvaeHealthFileSink USING Global.FileWriter (
+  directory: 'UploadedFiles',
+  filename: 'fcvae_health_assessments.json'
+)
+FORMAT USING Global.JSONFormatter ()
+INPUT FROM FcvaeHealthOutStream;
+
+END APPLICATION FcvaeMonitor;
+
+DEPLOY APPLICATION fcvaemon.FcvaeMonitor;
+START APPLICATION fcvaemon.FcvaeMonitor;
+
+quit;

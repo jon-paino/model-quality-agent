@@ -15,7 +15,10 @@ with date+K days and every other byte of the line is left untouched. K=0
 therefore reproduces the base file byte-for-byte.
 
 Subcommands:
-  prepare  slice the first N days out of the (496 MB) source CSV, streaming.
+  prepare  slice N days out of the (496 MB) source CSV, streaming. Default
+           start is the first row's date (the all-normal TRAIN range); pass
+           --start-date to cut a labeled range instead (F3 uses 2025-02-25,
+           source day 51, the start of the anomaly-bearing TEST range).
   emit     rewrite a base slice with dates shifted forward by K whole days.
 """
 import datetime as dt
@@ -43,16 +46,25 @@ def cli():
               type=click.Path(exists=True, dir_okay=False),
               help="Source transactions CSV (streamed, never loaded whole).")
 @click.option("--days", default=5, show_default=True, type=int,
-              help="Number of days to keep, starting at the first row's date.")
+              help="Number of days to keep, starting at the slice start.")
+@click.option("--start-date", "start_date", default=None,
+              help="Slice start date, YYYY-MM-DD (default: the first data row's date).")
 @click.option("--out", required=True, type=click.Path(dir_okay=False),
               help="Output base slice CSV.")
-def prepare(source, days, out):
-    """Slice the first N days of the source into a base feed, streaming."""
+def prepare(source, days, out, start_date):
+    """Slice N days of the source into a base feed, streaming."""
     _ensure_parent(out)
     kept = 0
     scanned = 0
     start_b = None
     cutoff_b = None
+    if start_date is not None:
+        try:
+            start = dt.date.fromisoformat(start_date)
+        except ValueError:
+            raise click.BadParameter(f"--start-date must be YYYY-MM-DD, got {start_date!r}")
+        start_b = start.isoformat().encode("ascii")
+        cutoff_b = (start + dt.timedelta(days=days)).isoformat().encode("ascii")
     with open(source, "rb") as fin, open(out, "wb") as fout:
         header = fin.readline()
         fout.write(header)
@@ -68,6 +80,10 @@ def prepare(source, days, out):
             if start_b <= line[:10] < cutoff_b:
                 fout.write(line)
                 kept += 1
+            elif line[:10] >= cutoff_b:
+                # The source is written in event-time order, so nothing past the
+                # cutoff can match; stop instead of scanning the remaining file.
+                break
     click.echo(f"prepare: kept {kept} of {scanned} data rows "
                f"({days} days from {start_b.decode('ascii') if start_b else '?'}) -> {out}")
 

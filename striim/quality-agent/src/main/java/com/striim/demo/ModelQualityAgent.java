@@ -173,6 +173,35 @@ import com.webaction.web.api.VaultAPI;
         // has no data (e.g. a 100%-miss tick emits no scored event). ----
         @PropertyTemplateProperty(name = "MlMetricsSource", type = String.class, required = false,
                 defaultValue = "STREAM"),
+        // ---- F3: model-quality metric signals (model_precision / model_recall /
+        // model_f1 / anomaly_rate), read from the eval_metrics.json a host-side
+        // evaluator (eval_labels.py) writes. Empty EvalMetricsFile = the families
+        // read UNKNOWN when enabled; a computed_utc older than EvalMaxAgeSec is
+        // stale = UNKNOWN, never a false PASS. EvalCombos lists the combo keys the
+        // agent EXPECTS (case-preserved; a listed combo absent from the file is a
+        // per-combo UNKNOWN); empty = discover combos from the file alone. ----
+        @PropertyTemplateProperty(name = "EvalMetricsFile", type = String.class, required = false,
+                defaultValue = ""),
+        @PropertyTemplateProperty(name = "EvalMaxAgeSec", type = Integer.class, required = false,
+                defaultValue = "900"),
+        @PropertyTemplateProperty(name = "EvalCombos", type = String.class, required = false,
+                defaultValue = ""),
+        // ---- F3 policy: metric floors are RELATIVE to each combo's published
+        // baseline b (the manifest's accepted point-adjusted eval, embedded in the
+        // eval file): WARN when metric < b * MetricWarnBelowBaselinePct/100, FAIL
+        // when metric < b * MetricFailBelowBaselinePct/100. Relative gating keeps a
+        // low-baseline model (Accel_CMP PA-F1 0.4595) from being born-FAIL under a
+        // one-size floor, and the baseline self-updates after every retrain.
+        // anomaly_rate stays an ABSOLUTE ceiling (percent of recent windows
+        // flagged): a spike is drift regardless of baseline. ----
+        @PropertyTemplateProperty(name = "MetricWarnBelowBaselinePct", type = Integer.class, required = false,
+                defaultValue = "80"),
+        @PropertyTemplateProperty(name = "MetricFailBelowBaselinePct", type = Integer.class, required = false,
+                defaultValue = "50"),
+        @PropertyTemplateProperty(name = "AnomalyRateWarnPct", type = Integer.class, required = false,
+                defaultValue = "40"),
+        @PropertyTemplateProperty(name = "AnomalyRateFailPct", type = Integer.class, required = false,
+                defaultValue = "70"),
         // ---- Layer 2 Phase 1 policy: upstream schema-evolution (DDL). WARN when
         // the per-tick delta of the source's DDL count crosses this threshold.
         // Phase 1 caps the signal at WARN (alert + verdict only, no circuit
@@ -216,7 +245,7 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     private static final String KNOWN_SIGNALS_CSV =
             "app_status,source_freshness,target_write_age,lag_end2end,backpressure,"
                     + "discarded_events,node_memory,node_cpu,feature_miss_rate,nan_score_rate,"
-                    + "schema_evolution";
+                    + "schema_evolution,model_precision,model_recall,model_f1,anomaly_rate";
     private static final Set<String> KNOWN_SIGNALS = Set.of(KNOWN_SIGNALS_CSV.split(","));
 
     // ---- configuration (the agent's policy), loaded in start() ----
@@ -234,6 +263,13 @@ public class ModelQualityAgent extends StriimOpenProcessor {
     private long discardedWarnDelta, discardedFailDelta;
     private int featureMissWarnPct, featureMissFailPct, nanScoreWarnPct, nanScoreFailPct;
     private String mlMetricsSource;          // "STREAM" | "MBEAN"
+    // F3: eval-file metric signal config. evalCombosExpected is case-PRESERVING
+    // (combo keys like "Penny_All" are case-sensitive file keys).
+    private String evalMetricsFile;
+    private long evalMaxAgeSec;
+    private List<String> evalCombosExpected = java.util.Collections.emptyList();
+    private int metricWarnBelowBaselinePct, metricFailBelowBaselinePct;
+    private int anomalyRateWarnPct, anomalyRateFailPct;
     private long ddlWarnDelta;       // Layer 2 Phase 1: DDL-count delta WARN threshold
     private boolean backpressureIsFail;
     private boolean treatYellowAsHealthy;
@@ -319,6 +355,13 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         nanScoreWarnPct = parseInt(p.get("NanScoreRateWarnPct"), 5);
         nanScoreFailPct = parseInt(p.get("NanScoreRateFailPct"), 20);
         mlMetricsSource = Objects.toString(p.get("MlMetricsSource"), "STREAM").trim().toUpperCase();
+        evalMetricsFile = Objects.toString(p.get("EvalMetricsFile"), "").trim();
+        evalMaxAgeSec = Math.max(1, parseInt(p.get("EvalMaxAgeSec"), 900));
+        evalCombosExpected = parseCsvList(p.get("EvalCombos"));
+        metricWarnBelowBaselinePct = parseInt(p.get("MetricWarnBelowBaselinePct"), 80);
+        metricFailBelowBaselinePct = parseInt(p.get("MetricFailBelowBaselinePct"), 50);
+        anomalyRateWarnPct = parseInt(p.get("AnomalyRateWarnPct"), 40);
+        anomalyRateFailPct = parseInt(p.get("AnomalyRateFailPct"), 70);
         ddlWarnDelta = parseInt(p.get("DdlWarnDelta"), 1);
         backpressureIsFail = parseBool(p.get("BackpressureIsFail"), false);
         treatYellowAsHealthy = parseBool(p.get("TreatYellowAsHealthy"), true);
@@ -368,6 +411,10 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         });
         scheduler.scheduleAtFixedRate(this::safeTick, 2, tickIntervalSec, TimeUnit.SECONDS);
 
+        if (evalMetricsFile.isEmpty()) {
+            log("EvalMetricsFile not configured: the model_precision/model_recall/"
+                    + "model_f1/anomaly_rate families are omitted from assessments");
+        }
         log("started: watching " + fqApp + " via " + healthSource + " ("
                 + ("MON_REST".equals(healthSource) ? monRestBaseUrl : jmxDomain)
                 + ") every " + tickIntervalSec + "s; signals="
@@ -477,6 +524,7 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         // same way regardless of source (see the shared helpers below).
         readOpCounterMbeans(s);
         readSchemaEvolutionMbean(s);
+        readEvalMetrics(s);
         return s;
     }
 
@@ -546,6 +594,7 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         // adds the on-stream ML path with this MBean read as the toggled fallback.
         readOpCounterMbeans(s);
         readSchemaEvolutionMbean(s);
+        readEvalMetrics(s);
         return s;
     }
 
@@ -581,6 +630,121 @@ public class ModelQualityAgent extends StriimOpenProcessor {
                             jsonLong(ddlMetrics, "Ignored DDL Count"),
                             jsonLong(ddlMetrics, "Filtered DDL Count"));
         s.lastDdl = jsonFirstText(ddlMetrics, "Last Received DDL");
+    }
+
+    /** F3: reads the host-side evaluator's eval_metrics.json into the snapshot.
+     *  Shared by both perceive sources (a local file read, independent of the
+     *  health transport). Fully defensive: any miss (unconfigured, unreadable,
+     *  unparseable, stale) sets evalUnavailableReason and leaves evalCombos empty,
+     *  so every enabled metric family reads UNKNOWN with that reason, never a
+     *  false PASS. The writer publishes via os.replace, so a tick never sees a
+     *  partial file. */
+    private void readEvalMetrics(final HealthSnapshot s) {
+        if (evalMetricsFile.isEmpty()) {
+            s.evalUnavailableReason = "EvalMetricsFile not configured";
+            return;
+        }
+        final String body;
+        try {
+            body = java.nio.file.Files.readString(java.nio.file.Paths.get(evalMetricsFile));
+        } catch (final Throwable t) {
+            s.evalUnavailableReason = "eval file missing/unreadable: " + evalMetricsFile;
+            return;
+        }
+        final JsonNode root;
+        try {
+            root = mapper.readTree(body);
+        } catch (final Throwable t) {
+            s.evalUnavailableReason = "eval file unparseable: " + t.getMessage();
+            return;
+        }
+        final Long computedMs = parseIsoUtcMs(text(root.get("computed_utc")));
+        if (computedMs == null) {
+            s.evalUnavailableReason = "eval computed_utc missing/unparseable";
+            return;
+        }
+        final long ageSec = Math.max(0L, (s.tickTs - computedMs) / 1000L);
+        s.evalAgeSec = ageSec;
+        if (ageSec > evalMaxAgeSec) {
+            s.evalUnavailableReason = "eval metrics stale (" + ageSec + "s old > EvalMaxAgeSec "
+                    + evalMaxAgeSec + "s)";
+            return;
+        }
+        final JsonNode combos = root.get("combos");
+        if (combos == null || !combos.isObject()) {
+            s.evalUnavailableReason = "eval file has no combos object";
+            return;
+        }
+        final java.util.Iterator<Map.Entry<String, JsonNode>> it = combos.fields();
+        while (it.hasNext()) {
+            final Map.Entry<String, JsonNode> e = it.next();
+            final EvalCombo ec = new EvalCombo();
+            ec.comboKey = e.getKey();
+            final JsonNode scoring = e.getValue().get("scoring");
+            if (scoring != null && scoring.isObject()) {
+                ec.anomalyRate = jsonDouble(scoring.get("anomaly_rate"));
+                ec.nWindows = jsonWholeLong(scoring.get("n_windows"));
+                ec.latestWindowEnd = text(scoring.get("latest_window_end"));
+            }
+            final JsonNode eval = e.getValue().get("eval");
+            if (eval != null && eval.isObject()) {
+                ec.hasEval = true;
+                ec.nLabels = jsonWholeLong(eval.get("n_labels"));
+                ec.nJoined = jsonWholeLong(eval.get("n_joined"));
+                ec.coverage = jsonDouble(eval.get("coverage"));
+                final JsonNode pa = eval.get("point_adjusted");
+                if (pa != null && pa.isObject()) {
+                    ec.precision = jsonDouble(pa.get("precision"));
+                    ec.recall = jsonDouble(pa.get("recall"));
+                    ec.f1 = jsonDouble(pa.get("f1"));
+                    ec.tp = jsonWholeLong(pa.get("tp"));
+                    ec.fp = jsonWholeLong(pa.get("fp"));
+                    ec.fn = jsonWholeLong(pa.get("fn"));
+                }
+                final JsonNode raw = eval.get("raw");
+                if (raw != null && raw.isObject()) {
+                    ec.rawPrecision = jsonDouble(raw.get("precision"));
+                    ec.rawRecall = jsonDouble(raw.get("recall"));
+                    ec.rawF1 = jsonDouble(raw.get("f1"));
+                }
+            }
+            final JsonNode baseline = e.getValue().get("baseline");
+            if (baseline != null && baseline.isObject()) {
+                ec.baselinePrecision = jsonDouble(baseline.get("pa_precision"));
+                ec.baselineRecall = jsonDouble(baseline.get("pa_recall"));
+                ec.baselineF1 = jsonDouble(baseline.get("pa_f1"));
+                ec.baselineModelVersion = text(baseline.get("model_version"));
+            }
+            s.evalCombos.put(ec.comboKey, ec);
+        }
+    }
+
+    // ---- JsonNode numeric coercions for the eval file (null-safe, no sentinel
+    // mapping: 0 and -1 are legitimate metric values, unlike the JMX asLong). ----
+    private static Double jsonDouble(final JsonNode n) {
+        return (n != null && n.isNumber()) ? n.asDouble() : null;
+    }
+
+    private static Long jsonWholeLong(final JsonNode n) {
+        return (n != null && n.isNumber()) ? n.asLong() : null;
+    }
+
+    /** Epoch ms from an ISO-8601 UTC string ("...+00:00" as Python isoformat
+     *  writes, or a trailing "Z"); null on any miss. */
+    private static Long parseIsoUtcMs(final String iso) {
+        if (iso == null || iso.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return java.time.OffsetDateTime.parse(iso.trim()).toInstant().toEpochMilli();
+        } catch (final Throwable t) {
+            // fall through to Instant for other well-formed UTC spellings
+        }
+        try {
+            return java.time.Instant.parse(iso.trim()).toEpochMilli();
+        } catch (final Throwable t) {
+            return null;
+        }
     }
 
     // =====================================================================
@@ -871,6 +1035,32 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         // DDL count, capped at WARN (alert + verdict only; no circuit breaker).
         if (isEnabled("schema_evolution")) {
             signals.add(assessSchemaEvolution(s));
+        }
+
+        // F3: model-quality metric signals off the host-side eval file, one
+        // instance per combo (model_f1[Penny_All]), gated on the BASE token like
+        // source_freshness. The P/R/F1 families are FLOORS relative to each
+        // combo's published baseline (below = degraded), the explicit inverse of
+        // the rate ceilings above; anomaly_rate stays an absolute ceiling.
+        // An EMPTY EvalMetricsFile means the eval feature is NOT CONFIGURED for
+        // this deployment: the families are OMITTED entirely (like a policy
+        // toggle, logged once in start()), so every pre-F3 deployment running
+        // with EnabledSignals ALL keeps its exact signal set. UNKNOWN is
+        // reserved for configured-but-unavailable (file missing, stale,
+        // unparseable, combo absent): never a false PASS.
+        if (!evalMetricsFile.isEmpty()) {
+            if (isEnabled("model_precision")) {
+                addModelMetricSignals(signals, s, "model_precision");
+            }
+            if (isEnabled("model_recall")) {
+                addModelMetricSignals(signals, s, "model_recall");
+            }
+            if (isEnabled("model_f1")) {
+                addModelMetricSignals(signals, s, "model_f1");
+            }
+            if (isEnabled("anomaly_rate")) {
+                addAnomalyRateSignals(signals, s);
+            }
         }
 
         // Roll up: RED if any FAIL, else YELLOW if any WARN, else GREEN. UNKNOWN
@@ -1222,6 +1412,199 @@ public class ModelQualityAgent extends StriimOpenProcessor {
                 null, null, total, lastDdl);
     }
 
+    /** Union of the operator-expected combos (EvalCombos, listed first) and the
+     *  combos present in the eval file, in stable order: an expected combo the
+     *  evaluator stopped reporting stays visible as UNKNOWN instead of silently
+     *  vanishing from the assessment. */
+    private List<String> evalComboUnion(final HealthSnapshot s) {
+        final java.util.LinkedHashSet<String> union =
+                new java.util.LinkedHashSet<>(evalCombosExpected);
+        union.addAll(s.evalCombos.keySet());
+        return new ArrayList<>(union);
+    }
+
+    /**
+     * F3: one metric family (model_precision / model_recall / model_f1) across
+     * combos. The gated value is the POINT-ADJUSTED metric: the published
+     * manifests' accepted baselines are point-adjusted, so the relative floor is
+     * apples-to-apples (raw rides along in the detail and extras). File-level
+     * unavailability (unconfigured, unreadable, stale) is ONE base-name UNKNOWN;
+     * per-combo misses (absent combo, no labels joined, missing metric/baseline)
+     * are per-combo UNKNOWNs naming the reason. Never a false PASS.
+     */
+    private void addModelMetricSignals(final List<SignalAssessment> out, final HealthSnapshot s,
+                                       final String family) {
+        if (s.evalUnavailableReason != null) {
+            out.add(unknown(family, s.evalUnavailableReason));
+            return;
+        }
+        for (final String combo : evalComboUnion(s)) {
+            final String nm = family + "[" + combo + "]";
+            final EvalCombo ec = s.evalCombos.get(combo);
+            if (ec == null) {
+                out.add(unknown(nm, "combo " + combo + " not present in eval file"));
+                continue;
+            }
+            if (!ec.hasEval) {
+                out.add(unknown(nm, "no labels joined for " + combo + " (eval section null)"));
+                continue;
+            }
+            final Double value;
+            final Double rawValue;
+            final Double baseline;
+            if ("model_precision".equals(family)) {
+                value = ec.precision;
+                rawValue = ec.rawPrecision;
+                baseline = ec.baselinePrecision;
+            } else if ("model_recall".equals(family)) {
+                value = ec.recall;
+                rawValue = ec.rawRecall;
+                baseline = ec.baselineRecall;
+            } else {
+                value = ec.f1;
+                rawValue = ec.rawF1;
+                baseline = ec.baselineF1;
+            }
+            if (value == null) {
+                out.add(unknown(nm, "point-adjusted metric missing for " + combo
+                        + " (n_joined=" + (ec.nJoined == null ? "?" : ec.nJoined) + ")"));
+                continue;
+            }
+            if (baseline == null) {
+                out.add(unknown(nm, "no published baseline for " + combo
+                        + " (manifest missing/unreadable)"));
+                continue;
+            }
+            out.add(assessMetricFloor(nm, value, rawValue, baseline, ec, s.evalAgeSec, combo));
+        }
+    }
+
+    /**
+     * FLOOR check relative to the combo's published baseline b: FAIL when the
+     * metric drops below b * MetricFailBelowBaselinePct/100, WARN below
+     * b * MetricWarnBelowBaselinePct/100, else PASS. The inverse of the rate
+     * ceilings above (BELOW the threshold = degraded).
+     */
+    private SignalAssessment assessMetricFloor(final String nm, final double value,
+            final Double rawValue, final double baseline, final EvalCombo ec,
+            final Long evalAgeSec, final String combo) {
+        final double warnFloor = baseline * metricWarnBelowBaselinePct / 100.0d;
+        final double failFloor = baseline * metricFailBelowBaselinePct / 100.0d;
+        final String observed = String.format("%.4f (point-adjusted)", value);
+        final SignalState state;
+        final String threshold;
+        if (value < failFloor) {
+            state = SignalState.FAIL;
+            threshold = String.format("< %.4f (%d%% of baseline %.4f)",
+                    failFloor, metricFailBelowBaselinePct, baseline);
+        } else if (value < warnFloor) {
+            state = SignalState.WARN;
+            threshold = String.format("< %.4f (%d%% of baseline %.4f)",
+                    warnFloor, metricWarnBelowBaselinePct, baseline);
+        } else {
+            state = SignalState.PASS;
+            threshold = String.format(">= %.4f (%d%% of baseline %.4f)",
+                    warnFloor, metricWarnBelowBaselinePct, baseline);
+        }
+        final String detail = String.format(
+                "%s pa=%.4f (raw %s; tp=%s fp=%s fn=%s) over %s/%s joined labels"
+                        + " (coverage %s); baseline %.4f (%s); eval age %ss",
+                nm, value,
+                rawValue == null ? "?" : String.format("%.4f", rawValue),
+                ec.tp == null ? "?" : ec.tp, ec.fp == null ? "?" : ec.fp,
+                ec.fn == null ? "?" : ec.fn,
+                ec.nJoined == null ? "?" : ec.nJoined,
+                ec.nLabels == null ? "?" : ec.nLabels,
+                ec.coverage == null ? "?" : String.format("%.1f%%", ec.coverage * 100.0d),
+                baseline,
+                ec.baselineModelVersion == null ? "?" : ec.baselineModelVersion,
+                evalAgeSec == null ? "?" : evalAgeSec);
+        final Map<String, Object> extras = new LinkedHashMap<>();
+        extras.put("combo", combo);
+        extras.put("value", value);
+        if (rawValue != null) {
+            extras.put("raw_value", rawValue);
+        }
+        extras.put("baseline", baseline);
+        if (ec.baselineModelVersion != null) {
+            extras.put("baseline_model_version", ec.baselineModelVersion);
+        }
+        if (ec.tp != null) {
+            extras.put("tp", ec.tp);
+            extras.put("fp", ec.fp);
+            extras.put("fn", ec.fn);
+        }
+        if (ec.nJoined != null) {
+            extras.put("n_joined", ec.nJoined);
+        }
+        if (ec.nLabels != null) {
+            extras.put("n_labels", ec.nLabels);
+        }
+        if (ec.coverage != null) {
+            extras.put("coverage", ec.coverage);
+        }
+        if (evalAgeSec != null) {
+            extras.put("eval_age_sec", evalAgeSec);
+        }
+        return new SignalAssessment(nm, observed, threshold, state, detail, extras);
+    }
+
+    /** F3: anomaly_rate per combo, an ABSOLUTE ceiling on the fraction of recent
+     *  windows the model flagged (a spike is drift regardless of the model's
+     *  accepted baseline; the F2 Feast threshold flip drives it to ~100%). */
+    private void addAnomalyRateSignals(final List<SignalAssessment> out, final HealthSnapshot s) {
+        if (s.evalUnavailableReason != null) {
+            out.add(unknown("anomaly_rate", s.evalUnavailableReason));
+            return;
+        }
+        for (final String combo : evalComboUnion(s)) {
+            final String nm = "anomaly_rate[" + combo + "]";
+            final EvalCombo ec = s.evalCombos.get(combo);
+            if (ec == null) {
+                out.add(unknown(nm, "combo " + combo + " not present in eval file"));
+                continue;
+            }
+            if (ec.anomalyRate == null) {
+                out.add(unknown(nm, "no scored windows for " + combo
+                        + " (scoring section absent)"));
+                continue;
+            }
+            final double pct = ec.anomalyRate * 100.0d;
+            final String observed = String.format("%.1f%% of last %s windows",
+                    pct, ec.nWindows == null ? "?" : ec.nWindows);
+            final SignalState state;
+            final String threshold;
+            if (pct >= anomalyRateFailPct) {
+                state = SignalState.FAIL;
+                threshold = ">= " + anomalyRateFailPct + "%";
+            } else if (pct >= anomalyRateWarnPct) {
+                state = SignalState.WARN;
+                threshold = ">= " + anomalyRateWarnPct + "%";
+            } else {
+                state = SignalState.PASS;
+                threshold = "< " + anomalyRateWarnPct + "%";
+            }
+            final String detail = String.format(
+                    "%s flagged %.1f%% of the last %s scored windows (latest %s); eval age %ss",
+                    combo, pct, ec.nWindows == null ? "?" : ec.nWindows,
+                    ec.latestWindowEnd == null ? "?" : ec.latestWindowEnd,
+                    s.evalAgeSec == null ? "?" : s.evalAgeSec);
+            final Map<String, Object> extras = new LinkedHashMap<>();
+            extras.put("combo", combo);
+            extras.put("value", ec.anomalyRate);
+            if (ec.nWindows != null) {
+                extras.put("n_windows", ec.nWindows);
+            }
+            if (ec.latestWindowEnd != null) {
+                extras.put("latest_window_end", ec.latestWindowEnd);
+            }
+            if (s.evalAgeSec != null) {
+                extras.put("eval_age_sec", s.evalAgeSec);
+            }
+            out.add(new SignalAssessment(nm, observed, threshold, state, detail, extras));
+        }
+    }
+
     private String buildRationale(final Verdict v, final List<SignalAssessment> signals,
                                   final int fail, final int warn) {
         final StringBuilder sb = new StringBuilder();
@@ -1343,6 +1726,11 @@ public class ModelQualityAgent extends StriimOpenProcessor {
                 if (sa.lastDdl != null) {
                     sm.put("last_ddl", sa.lastDdl);
                 }
+            }
+            // F3: typed extras (combo, value, baseline, join counts) on the
+            // eval-file metric signals; the acceptance checker asserts on these.
+            if (sa.extras != null) {
+                sm.putAll(sa.extras);
             }
             sigs.add(sm);
         }
@@ -1642,6 +2030,20 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         disabledSignals = java.util.Collections.unmodifiableList(off);
     }
 
+    /** Case-PRESERVING CSV -> list (order kept, blanks dropped). Used for
+     *  EvalCombos, whose tokens are case-sensitive eval-file keys, so the
+     *  toUpperSet helper must not be reused here. */
+    private static List<String> parseCsvList(final Object v) {
+        final List<String> out = new ArrayList<>();
+        for (final String s : Objects.toString(v, "").split(",")) {
+            final String t = s.trim();
+            if (!t.isEmpty()) {
+                out.add(t);
+            }
+        }
+        return java.util.Collections.unmodifiableList(out);
+    }
+
     private static Set<String> toUpperSet(final String csv) {
         final Set<String> out = new java.util.HashSet<>();
         for (final String s : csv.split(",")) {
@@ -1692,6 +2094,13 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         // non-CDC source (no CDC_OPERATION attribute) -> signal is UNKNOWN.
         public Long ddlCount;
         public String lastDdl;
+        // F3: parsed eval-metrics file state (one EvalCombo per combo present).
+        // A non-null evalUnavailableReason means the FILE was unusable this tick
+        // (unconfigured / unreadable / unparseable / stale): combos stay empty and
+        // every enabled metric family reads UNKNOWN with that reason.
+        public final Map<String, EvalCombo> evalCombos = new LinkedHashMap<>();
+        public String evalUnavailableReason;
+        public Long evalAgeSec;
     }
 
     public static final class ComponentTime {
@@ -1719,19 +2128,36 @@ public class ModelQualityAgent extends StriimOpenProcessor {
         // exact count. Null for non-schema signals (omitted from serialized output).
         public final Long ddlsTotal;
         public final String lastDdl;
+        // F3: typed extras merged into the serialized signal object (combo, value,
+        // baseline, join counts for the metric signals). Null for every other
+        // signal, so taxi output bytes are unchanged.
+        public final Map<String, Object> extras;
         public SignalAssessment(final String name, final String observed, final String threshold,
                                 final SignalState state, final String detail) {
-            this(name, observed, threshold, state, detail, null, null, null, null);
+            this(name, observed, threshold, state, detail, null, null, null, null, null);
         }
         public SignalAssessment(final String name, final String observed, final String threshold,
                                 final SignalState state, final String detail,
                                 final Long eventsSeen, final Long faults) {
-            this(name, observed, threshold, state, detail, eventsSeen, faults, null, null);
+            this(name, observed, threshold, state, detail, eventsSeen, faults, null, null, null);
         }
         public SignalAssessment(final String name, final String observed, final String threshold,
                                 final SignalState state, final String detail,
                                 final Long eventsSeen, final Long faults,
                                 final Long ddlsTotal, final String lastDdl) {
+            this(name, observed, threshold, state, detail, eventsSeen, faults,
+                    ddlsTotal, lastDdl, null);
+        }
+        public SignalAssessment(final String name, final String observed, final String threshold,
+                                final SignalState state, final String detail,
+                                final Map<String, Object> extras) {
+            this(name, observed, threshold, state, detail, null, null, null, null, extras);
+        }
+        public SignalAssessment(final String name, final String observed, final String threshold,
+                                final SignalState state, final String detail,
+                                final Long eventsSeen, final Long faults,
+                                final Long ddlsTotal, final String lastDdl,
+                                final Map<String, Object> extras) {
             this.name = name;
             this.observed = observed;
             this.threshold = threshold;
@@ -1741,7 +2167,32 @@ public class ModelQualityAgent extends StriimOpenProcessor {
             this.faults = faults;
             this.ddlsTotal = ddlsTotal;
             this.lastDdl = lastDdl;
+            this.extras = extras;
         }
+    }
+
+    /** F3: one combo's parsed eval-file state. PUBLIC fields per the .scm
+     *  class-loader rule. Created per tick inside perceive() (never an OP field
+     *  at start), so Striim's reflective no-arg instantiation rule does not
+     *  apply; the implicit no-arg ctor exists anyway. Nullable wrappers
+     *  throughout: absent JSON fields stay null and assess() maps null to a
+     *  per-combo UNKNOWN, never a false PASS. */
+    public static final class EvalCombo {
+        public String comboKey;
+        // scoring section (labels-independent)
+        public Double anomalyRate;          // fraction in [0,1]
+        public Long nWindows;
+        public String latestWindowEnd;
+        // eval section (label-joined); hasEval false when eval is null
+        public boolean hasEval;
+        public Long nLabels, nJoined;
+        public Double coverage;
+        public Double precision, recall, f1;              // point-adjusted
+        public Long tp, fp, fn;                           // point-adjusted counts
+        public Double rawPrecision, rawRecall, rawF1;     // raw last-point
+        // baseline section (published manifest's accepted point-adjusted eval)
+        public Double baselinePrecision, baselineRecall, baselineF1;
+        public String baselineModelVersion;
     }
 
     /** Phase 1b: one OP-counter reading (cumulative), keyed by self-describing CounterName. */
